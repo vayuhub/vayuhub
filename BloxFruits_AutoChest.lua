@@ -26,6 +26,7 @@ local Config = {
     AnchorMergeDistance = 700, -- isse kam door wali location ko duplicate maanega
     FarmButtonName = "Auto Chest Farm",
     MinServerHours = 4,        -- server hop sirf itne ghante purane (4h+) servers pe karega
+    MaxHopAttempts = 12,       -- itne failed hops ke baad current server pe hi farm (no infinite hop)
 }
 
 --================ TARGET ITEMS ================--
@@ -821,12 +822,122 @@ local function waitForCharacter(timeout)
     return game:IsLoaded() and getHRP() ~= nil
 end
 
+--================ SERVER AGE ESTIMATE ================--
+-- Roblox client ko true server uptime nahi deta (DistributedGameTime = join time).
+-- Isliye best estimate: JobId first-seen (persisted) + replicated start-time scan + join time.
+local SERVER_SEEN_FILE = "bf_server_firstseen.txt"
+local serverSeenCache = nil
+
+local function loadServerSeen()
+    if serverSeenCache then return serverSeenCache end
+    serverSeenCache = {}
+    pcall(function()
+        if readfile and isfile and isfile(SERVER_SEEN_FILE) then
+            for line in tostring(readfile(SERVER_SEEN_FILE)):gmatch("[^\r\n]+") do
+                local id, ts = line:match("([^|]+)|(%d+)")
+                if id and ts then
+                    serverSeenCache[id] = tonumber(ts)
+                end
+            end
+        end
+    end)
+    return serverSeenCache
+end
+
+local function recordServerSeen()
+    local seen = loadServerSeen()
+    local jobId = game.JobId
+    if jobId == "" or seen[jobId] then return end
+    seen[jobId] = os.time()
+    pcall(function()
+        if writefile then
+            local lines = {}
+            for id, ts in pairs(seen) do
+                table.insert(lines, id .. "|" .. tostring(ts))
+            end
+            if #lines > 300 then
+                table.sort(lines, function(a, b)
+                    return tonumber(a:match("|(%d+)$")) > tonumber(b:match("|(%d+)$"))
+                end)
+                local trimmed = {}
+                for i = 1, 300 do trimmed[i] = lines[i] end
+                lines = trimmed
+            end
+            writefile(SERVER_SEEN_FILE, table.concat(lines, "\n"))
+        end
+    end)
+end
+
+local replicatedStartCache = nil
+local function getReplicatedServerStart()
+    if replicatedStartCache ~= nil then return replicatedStartCache end
+    replicatedStartCache = false
+    local now = os.time()
+    local function plausible(v)
+        return type(v) == "number" and v > 1.6e9 and v <= now + 60
+            and (now - v) > 0 and (now - v) < 45 * 86400
+    end
+    local function checkAttrs(inst)
+        local ok, attrs = pcall(function() return inst:GetAttributes() end)
+        if ok and type(attrs) == "table" then
+            for k, v in pairs(attrs) do
+                local kl = tostring(k):lower()
+                if plausible(v) and (kl:find("start") or kl:find("time") or kl:find("age") or kl:find("creat") or kl:find("boot") or kl:find("launch")) then
+                    return v
+                end
+            end
+        end
+        return nil
+    end
+    local function checkValue(inst)
+        if inst:IsA("NumberValue") or inst:IsA("IntValue") then
+            local nl = inst.Name:lower()
+            if plausible(inst.Value) and (nl:find("start") or nl:find("time") or nl:find("age") or nl:find("creat") or nl:find("boot") or nl:find("launch")) then
+                return inst.Value
+            end
+        end
+        return nil
+    end
+    local roots = { game, Workspace, ReplicatedStorage }
+    local scanned = 0
+    for _, root in ipairs(roots) do
+        local s = checkAttrs(root)
+        if s then replicatedStartCache = s return s end
+        for _, child in ipairs(root:GetChildren()) do
+            scanned += 1
+            if scanned > 4000 then break end
+            local v = checkAttrs(child) or checkValue(child)
+            if v then replicatedStartCache = v return v end
+        end
+        if scanned > 4000 then break end
+    end
+    return false
+end
+
+local function getEstimatedServerAge()
+    recordServerSeen()
+    local best = getServerUptimeSeconds() -- join time (lower bound)
+    local seen = loadServerSeen()
+    local firstSeen = seen[game.JobId]
+    if firstSeen then
+        best = math.max(best, os.time() - firstSeen)
+    end
+    local rsStart = getReplicatedServerStart()
+    if rsStart then
+        best = math.max(best, os.time() - rsStart)
+    end
+    return best
+end
+
+local pendingHopCount = 0
+
 local function writeHopMarker(farmFlag)
     pcall(function()
         if writefile then
-            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0"))
+            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0") .. "|" .. tostring(pendingHopCount))
         end
     end)
+    pendingHopCount = 0
 end
 
 local function clearHopMarker()
@@ -947,8 +1058,9 @@ local function checkServerHopMarker()
     end)
     if not data or data == "" then return end
 
-    local ts, farmFlag = tostring(data):match("(%d+)|(%d)")
+    local ts, farmFlag, hopCount = tostring(data):match("(%d+)|(%d)|?(%d*)")
     ts = tonumber(ts)
+    hopCount = tonumber(hopCount) or 0
     if not ts or (os.time() - ts) > HOP_MARKER_MAX_AGE then
         clearHopMarker()
         return
@@ -962,15 +1074,27 @@ local function checkServerHopMarker()
         end
         task.wait(1.5)
 
-        local uptime = getServerUptimeSeconds()
+        -- Spawn point restricted/unsafe area mein ho sakta hai - safe zone mein land karo
+        local zone = nearestSafeZoneCF()
+        if zone and getHRP() then
+            warpTo(zone.CFrame + Vector3.new(0, 8, 0))
+            task.wait(0.8)
+        end
+
+        local age = getEstimatedServerAge()
         local minUptime = Config.MinServerHours * 3600
-        if uptime >= minUptime then
+        if age >= minUptime or hopCount >= Config.MaxHopAttempts then
             clearHopMarker()
-            notify("Joined " .. math.floor(uptime / 3600) .. "h+ server")
-            updateStatus("4h+ server joined")
+            if hopCount >= Config.MaxHopAttempts and age < minUptime then
+                notify("Hop limit - is server pe farm kar rahe hain")
+                updateStatus("Hop limit reached - farming here")
+            else
+                notify("Joined " .. math.floor(age / 3600) .. "h+ server")
+                updateStatus("4h+ server joined")
+            end
             if farmFlag == "1" then
                 -- Anti-cheat settle hone ka time do, phir hi farm resume karo
-                task.delay(4, function()
+                task.delay(5, function()
                     if waitForCharacter(10) then
                         startChestFarm()
                     else
@@ -979,8 +1103,9 @@ local function checkServerHopMarker()
                 end)
             end
         else
-            updateStatus("Server " .. math.floor(uptime / 60) .. "m old - hopping again...")
-            task.delay(2.5, function()
+            updateStatus("Server " .. math.floor(age / 60) .. "m old - hopping again...")
+            pendingHopCount = hopCount + 1
+            task.delay(3, function()
                 if waitForCharacter(15) then
                     serverHop()
                 end
@@ -1232,7 +1357,7 @@ local function buildGUI()
 
     task.spawn(function()
         while serverAgeLabel and serverAgeLabel.Parent do
-            serverAgeLabel.Text = "Server Age: " .. formatUptime(getServerUptimeSeconds())
+            serverAgeLabel.Text = "Server Age: " .. formatUptime(getEstimatedServerAge()) .. " (est)"
             task.wait(1)
         end
     end)
