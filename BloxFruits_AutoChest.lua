@@ -31,6 +31,10 @@ local Config = {
     FarmButtonName = "Auto Chest Farm",
     MinServerHours = 4,        -- server hop sirf itne ghante purane (4h+) servers pe karega
     MaxHopAttempts = 12,       -- itne failed hops ke baad current server pe hi farm (no infinite hop)
+    AutoHopInterval = 60,      -- auto server hop har itne seconds
+    HopRetryDelay = 4,         -- teleport fail ho toh itne seconds mein retry
+    MaxAutoHops = 34,          -- auto hop ka total limit
+    AutoHopSessionReset = 2700,-- itne seconds baad hop counter reset (naya session)
 }
 
 --================ TARGET ITEMS ================--
@@ -946,10 +950,11 @@ end
 
 local pendingHopCount = 0
 
-local function writeHopMarker(farmFlag)
+-- Marker format: timestamp|farmFlag|hopCount|mode ("a" = any-server auto hop, no age check)
+local function writeHopMarker(farmFlag, mode)
     pcall(function()
         if writefile then
-            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0") .. "|" .. tostring(pendingHopCount))
+            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0") .. "|" .. tostring(pendingHopCount) .. "|" .. (mode or ""))
         end
     end)
     pendingHopCount = 0
@@ -997,7 +1002,7 @@ local function httpGet(url)
     return game:HttpGet(url)
 end
 
-function serverHop()
+function serverHop(anyServer)
     local wasFarming = farming
     farming = false
     if activeTween then
@@ -1010,7 +1015,11 @@ function serverHop()
         farmButton.Text = "Auto Chest Farm: OFF"
         farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
     end
-    updateStatus("Hopping for " .. Config.MinServerHours .. "h+ server...")
+    if anyServer then
+        updateStatus("Auto hop: random server...")
+    else
+        updateStatus("Hopping for " .. Config.MinServerHours .. "h+ server...")
+    end
 
     -- Restricted area se bachne ke liye hop se pehle safe zone mein jao
     local hopZone = nearestSafeZoneCF()
@@ -1018,6 +1027,15 @@ function serverHop()
         updateStatus("Safe zone before hop...")
         warpTo(hopZone.CFrame + Vector3.new(0, 8, 0))
         task.wait(0.8)
+    end
+
+    -- Auto-hop mode: kisi bhi random server pe jao (server list ki zaroorat nahi)
+    if anyServer then
+        writeHopMarker(wasFarming, "a")
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, Player)
+        end)
+        return
     end
 
     local servers = {}
@@ -1070,6 +1088,82 @@ function serverHop()
     end
 end
 
+--================ AUTO SERVER HOP (har 60s, koi bhi server) ================--
+local AUTO_HOP_FILE = "bf_auto_hop.txt"
+local autoHopEnabled = true
+local autoHopButton = nil
+
+local function updateAutoHopButton()
+    if autoHopButton then
+        autoHopButton.Text = autoHopEnabled and "6. Auto Hop (60s): ON" or "6. Auto Hop (60s): OFF"
+        autoHopButton.BackgroundColor3 = autoHopEnabled and Color3.fromRGB(60, 200, 90) or Color3.fromRGB(220, 60, 60)
+    end
+end
+
+local function loadAutoHopState()
+    local count, last = 0, 0
+    pcall(function()
+        if readfile and isfile and isfile(AUTO_HOP_FILE) then
+            local c, l = tostring(readfile(AUTO_HOP_FILE)):match("(%d+)|?(%d*)")
+            count = tonumber(c) or 0
+            last = tonumber(l) or 0
+        end
+    end)
+    -- Purana session ho toh counter reset
+    if os.time() - last > Config.AutoHopSessionReset then
+        count = 0
+    end
+    return count, last
+end
+
+local function saveAutoHopState(count, last)
+    pcall(function()
+        if writefile then
+            writefile(AUTO_HOP_FILE, tostring(count) .. "|" .. tostring(last))
+        end
+    end)
+end
+
+local function autoHopLoop()
+    local count, lastHop = loadAutoHopState()
+    if lastHop == 0 then
+        lastHop = os.time() -- fresh session: pehla hop 60s baad
+    end
+    while true do
+        task.wait(1)
+        if autoHopEnabled then
+            local remain = Config.AutoHopInterval - (os.time() - lastHop)
+            if remain <= 0 then
+                if count >= Config.MaxAutoHops then
+                    notify("Auto hop limit (" .. Config.MaxAutoHops .. ") reached - auto hop OFF")
+                    updateStatus("Auto hop limit reached")
+                    autoHopEnabled = false
+                    updateAutoHopButton()
+                else
+                    count += 1
+                    lastHop = os.time()
+                    saveAutoHopState(count, lastHop)
+                    updateStatus("Auto hop " .. count .. "/" .. Config.MaxAutoHops .. " - random server")
+                    serverHop(true)
+                    -- Teleport fail ho (same JobId) toh har 4s mein retry
+                    local oldJob = game.JobId
+                    for _ = 1, 4 do
+                        task.wait(Config.HopRetryDelay)
+                        if game.JobId ~= oldJob then break end
+                        if count < Config.MaxAutoHops then
+                            count += 1
+                            lastHop = os.time()
+                            saveAutoHopState(count, lastHop)
+                        end
+                        serverHop(true)
+                        oldJob = game.JobId
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- Naye server pe script re-run hone ke baad: agar hum 4h+ hop ke beech mein the
 -- toh uptime check karo; kam hai toh dobara hop, 4h+ hai toh (chahiye toh) farm resume.
 local function checkServerHopMarker()
@@ -1081,9 +1175,14 @@ local function checkServerHopMarker()
     end)
     if not data or data == "" then return end
 
-    local ts, farmFlag, hopCount = tostring(data):match("(%d+)|(%d)|?(%d*)")
-    ts = tonumber(ts)
-    hopCount = tonumber(hopCount) or 0
+    local parts = {}
+    for part in tostring(data):gmatch("[^|]+") do
+        table.insert(parts, part)
+    end
+    local ts = tonumber(parts[1])
+    local farmFlag = parts[2]
+    local hopCount = tonumber(parts[3]) or 0
+    local mode = parts[4]
     if not ts or (os.time() - ts) > HOP_MARKER_MAX_AGE then
         clearHopMarker()
         return
@@ -1102,6 +1201,21 @@ local function checkServerHopMarker()
         if zone and getHRP() then
             warpTo(zone.CFrame + Vector3.new(0, 8, 0))
             task.wait(0.8)
+        end
+
+        -- Auto-hop ("a" mode): kisi bhi server pe land kiya - age check skip, bas settle karke farm resume
+        if mode == "a" then
+            clearHopMarker()
+            notify("Joined server (auto hop)")
+            updateStatus("Server joined")
+            if farmFlag == "1" then
+                task.delay(5, function()
+                    if waitForCharacter(10) then
+                        startChestFarm()
+                    end
+                end)
+            end
+            return
         end
 
         local age = getEstimatedServerAge()
@@ -1292,8 +1406,8 @@ local function buildGUI()
     gui.Parent = playerGui
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 280, 0, 344)
-    frame.Position = UDim2.new(0.5, -140, 0.5, -172)
+    frame.Size = UDim2.new(0, 280, 0, 384)
+    frame.Position = UDim2.new(0.5, -140, 0.5, -192)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
     frame.BorderSizePixel = 0
     frame.Active = true
@@ -1367,9 +1481,16 @@ local function buildGUI()
         end
     end)
 
+    autoHopButton = makeButton("6. Auto Hop (60s): ON", 310, Color3.fromRGB(60, 200, 90), function()
+        autoHopEnabled = not autoHopEnabled
+        updateAutoHopButton()
+        updateStatus(autoHopEnabled and "Auto hop ON - har 60s random server" or "Auto hop OFF")
+    end)
+    updateAutoHopButton()
+
     serverAgeLabel = Instance.new("TextLabel")
     serverAgeLabel.Size = UDim2.new(1, -20, 0, 16)
-    serverAgeLabel.Position = UDim2.new(0, 10, 0, 308)
+    serverAgeLabel.Position = UDim2.new(0, 10, 0, 352)
     serverAgeLabel.BackgroundTransparency = 1
     serverAgeLabel.Text = "Server Age: --"
     serverAgeLabel.TextColor3 = Color3.fromRGB(140, 220, 160)
@@ -1436,6 +1557,7 @@ end)
 
 --================ BOOT ================--
 buildGUI()
+task.spawn(autoHopLoop)
 checkServerHopMarker()
 updateStatus("Script loaded - press Auto Chest Farm")
 notify("Blox Fruits mod menu loaded")
