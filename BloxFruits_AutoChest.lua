@@ -17,13 +17,17 @@ local getgenv = getgenv or function() return _G end
 local Config = {
     TweenSpeed = 360,          -- studs/sec, thoda fast but still safe for most executors
     TeleportSpeed = 1000,      -- manual teleport buttons ke liye fast tween speed
-    ChestOpenWait = 0.25,      -- wait after reaching chest
-    AfterChestWait = 0.35,     -- wait before next chest
+    ChestOpenWait = 0.4,       -- wait after reaching chest
+    AfterChestWait = 0.5,      -- wait before next chest
     NoChestWait = 2.5,         -- wait before server hop when no chest found
-    IslandCheckWait = 0.6,     -- wait after moving to island anchor
-    LongDistance = 600,        -- isse zyada door ho toh seedha warp (fast claim)
+    IslandCheckWait = 0.8,     -- wait after moving to island anchor
+    LongDistance = 600,        -- isse zyada door ho toh fast travel (far chest)
     ProbeDistance = 700,       -- island anchor ke around itne studs check karega
     AnchorMergeDistance = 700, -- isse kam door wali location ko duplicate maanega
+    ProbeSpeed = 500,          -- island probe tween speed (slow = anti-cheat safe)
+    FarTravelSpeed = 800,      -- bahut door ke chest tak ki max tween speed
+    ChestArriveDistance = 120, -- itne se zyada door ho toh chest claim skip (retry allowed)
+    MaxChestAttempts = 2,      -- ek chest ko max itni baar try karega
     FarmButtonName = "Auto Chest Farm",
     MinServerHours = 4,        -- server hop sirf itne ghante purane (4h+) servers pe karega
     MaxHopAttempts = 12,       -- itne failed hops ke baad current server pe hi farm (no infinite hop)
@@ -136,6 +140,7 @@ local ProbeOffsets = {
 --================ STATE ================--
 local farming = false
 local visitedChests = {}
+local chestAttempts = {}
 local islandAnchors = {}
 local islandIndex = 1
 local probeIndex = 1
@@ -491,7 +496,7 @@ local function travelToCF(cf)
     -- isliye frame-by-frame movement use karo.
     if dist > Config.LongDistance then
         updateStatus("Traveling far: " .. math.floor(dist) .. " studs")
-        local speed = math.clamp(dist / 4, Config.TeleportSpeed, 1400)
+        local speed = math.clamp(dist / 5, Config.TweenSpeed, Config.FarTravelSpeed)
         tweenTo(cf, speed, true)
         task.wait(0.15)
         return farming
@@ -649,24 +654,33 @@ local function chestFarmLoop()
 
         local chest = getNearestChest()
         if chest then
-            visitedChests[chest] = true
             local cf = getChestCFrame(chest)
             if cf then
                 updateStatus("Chest: " .. chest.Name)
                 setProbeAnchor(false)
                 travelToCF(cf)
-                -- Agar travel ke baad bhi chest ke paas nahi pahunche toh skip (loop na lage)
+                -- Agar travel ke baad bhi chest ke paas nahi pahunche toh retry counter badhao
                 local hrp = getHRP()
-                if hrp and (hrp.Position - cf.Position).Magnitude > 150 then
-                    task.wait(0.2)
+                local dist = hrp and (hrp.Position - cf.Position).Magnitude or math.huge
+                if dist > Config.ChestArriveDistance then
+                    chestAttempts[chest] = (chestAttempts[chest] or 0) + 1
+                    if chestAttempts[chest] >= Config.MaxChestAttempts then
+                        visitedChests[chest] = true -- baar-baar fail ho toh skip
+                    end
+                    task.wait(0.3)
+                else
+                    visitedChests[chest] = true
+                    chestAttempts[chest] = nil
+                    if hasTargetItem() then
+                        local got = hasTargetItem()
+                        stopFarmForItem(got)
+                        break
+                    end
+                    openChest(chest)
+                    task.wait(Config.AfterChestWait)
                 end
-                if hasTargetItem() then
-                    local got = hasTargetItem()
-                    stopFarmForItem(got)
-                    break
-                end
-                openChest(chest)
-                task.wait(Config.AfterChestWait)
+            else
+                visitedChests[chest] = true -- CFrame nahi mila, dobara try mat karo
             end
         else
             if islandTourDone then
@@ -681,7 +695,7 @@ local function chestFarmLoop()
                 updateStatus("Checking: " .. probeName)
                 -- Island/probe ke liye fast tween - instant warp anti-cheat reset kar deta hai.
                 -- Probe ke time anchor rakho taaki paani/void mein girkar na mare.
-                tweenTo(probeCF, 800, true)
+                tweenTo(probeCF, Config.ProbeSpeed, true)
                 setProbeAnchor(true)
                 task.wait(Config.IslandCheckWait)
             else
@@ -954,6 +968,7 @@ end
 local function startChestFarm()
     farming = true
     visitedChests = {}
+    chestAttempts = {}
     islandTourDone = false
     islandIndex = 1
     probeIndex = 1
