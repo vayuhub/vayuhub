@@ -50,6 +50,7 @@ local TravelRemote = {
 --================ COORDINATES (from public scripts/wiki) ================--
 local DarkArenaCF = CFrame.new(3876.00366, 24.6882591, -3820.21777) -- Darkbeard/Dark Arena area
 local CastleOnSeaCF = CFrame.new(-5074.45556640625, 314.5155334472656, -2991.054443359375)
+local HotAndColdCF = CFrame.new(-5600, 80, -5100) -- Hot and Cold island (Secret Laboratory / FOD)
 
 local SafeZones = {
     [1] = {
@@ -89,6 +90,7 @@ local IslandRoutes = {
         { Name = "Flamingo Mansion", CFrame = CFrame.new(-483.73370361328, 332.0383605957, 595.32708740234) },
         { Name = "Flamingo Room", CFrame = CFrame.new(2284.4140625, 15.152037620544, 875.72534179688) },
         { Name = "Green Zone", CFrame = CFrame.new(-2448.5300292969, 73.016105651855, -3210.6306152344) },
+        { Name = "Hot and Cold", CFrame = HotAndColdCF },
         { Name = "Factory", CFrame = CFrame.new(424.12698364258, 211.16171264648, -427.54049682617) },
         { Name = "Colosseum", CFrame = CFrame.new(-1503.6224365234, 219.7956237793, 1369.3101806641) },
         { Name = "Zombie Island", CFrame = CFrame.new(-5622.033203125, 492.19604492188, -781.78552246094) },
@@ -113,11 +115,22 @@ local IslandRoutes = {
     },
 }
 
+--================ PROBE POINTS (6 per island) ================--
+local ProbeOffsets = {
+    Vector3.new(0, 0, 0),
+    Vector3.new(Config.ProbeDistance, 0, 0),
+    Vector3.new(-Config.ProbeDistance, 0, 0),
+    Vector3.new(0, 0, Config.ProbeDistance),
+    Vector3.new(0, 0, -Config.ProbeDistance),
+    Vector3.new(Config.ProbeDistance, 0, Config.ProbeDistance),
+}
+
 --================ STATE ================--
 local farming = false
 local visitedChests = {}
 local islandAnchors = {}
 local islandIndex = 1
+local probeIndex = 1
 local islandTourDone = false
 local activeTween = nil
 local statusLabel = nil
@@ -407,44 +420,34 @@ local function refreshIslandAnchors()
         end)
     end
 
-    -- Har island ke around probe points banao taaki door ke chests bhi load/check ho
-    local expanded = {}
-    local d = Config.ProbeDistance
-    local offsets = {
-        Vector3.new(0, 0, 0),
-        Vector3.new(d, 0, 0),
-        Vector3.new(-d, 0, 0),
-        Vector3.new(0, 0, d),
-        Vector3.new(0, 0, -d),
-    }
-    for _, anchor in ipairs(islandAnchors) do
-        for i, off in ipairs(offsets) do
-            table.insert(expanded, {
-                Name = anchor.Name .. " #" .. i,
-                CFrame = CFrame.new(anchor.CFrame.Position + Vector3.new(off.X, 35, off.Z)),
-            })
-        end
-    end
-    islandAnchors = expanded
-
     islandIndex = 1
+    probeIndex = 1
     islandTourDone = false
 end
 
-local function getNextIslandAnchor()
+local function getNextProbe()
     if #islandAnchors == 0 then
         refreshIslandAnchors()
     end
     if #islandAnchors == 0 then
         return nil
     end
-    local anchor = islandAnchors[islandIndex]
-    islandIndex += 1
-    if islandIndex > #islandAnchors then
-        islandIndex = 1
-        islandTourDone = true
+
+    local island = islandAnchors[islandIndex]
+    local off = ProbeOffsets[probeIndex]
+    local label = island.Name .. " probe " .. probeIndex
+
+    probeIndex += 1
+    if probeIndex > #ProbeOffsets then
+        probeIndex = 1
+        islandIndex += 1
+        if islandIndex > #islandAnchors then
+            islandIndex = 1
+            islandTourDone = true
+        end
     end
-    return anchor
+
+    return CFrame.new(island.CFrame.Position + Vector3.new(off.X, 35, off.Z)), label
 end
 
 local function chestFarmLoop()
@@ -458,8 +461,6 @@ local function chestFarmLoop()
 
         local chest = getNearestChest()
         if chest then
-            islandTourDone = false
-            islandIndex = 1
             local cf = getChestCFrame(chest)
             if cf then
                 visitedChests[chest] = true
@@ -481,11 +482,10 @@ local function chestFarmLoop()
                 break
             end
 
-            local anchor = getNextIslandAnchor()
-            if anchor then
-                updateStatus("Checking: " .. anchor.Name)
-                local target = anchor.CFrame + Vector3.new(0, 35, 0)
-                travelToCF(CFrame.new(target))
+            local probeCF, probeName = getNextProbe()
+            if probeCF then
+                updateStatus("Checking: " .. probeName)
+                travelToCF(probeCF)
                 task.wait(Config.IslandCheckWait)
             else
                 updateStatus("No island anchors - hopping")
@@ -530,7 +530,7 @@ local function travelToSea(sea)
     pcall(function()
         ReplicatedStorage.Remotes.CommF_:InvokeServer(remoteName)
     end)
-    task.wait(1.5)
+    task.wait(2.5)
 end
 
 local function teleportDarkArena()
@@ -651,6 +651,147 @@ function serverHop()
     end
 end
 
+--================ FIST OF DARKNESS / SECRET LAB ================--
+local function hasSpecificItem(itemName)
+    for _, container in ipairs({ Player.Backpack, Player.Character }) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item.Name == itemName then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function findLabTarget()
+    local map = Workspace:FindFirstChild("Map") or Workspace
+    local keywords = { "secret", "order", "microchip", "core", "fist", "darkness", "cyborg", "pod", "tube" }
+    local hrp = getHRP()
+    local basePos = hrp and hrp.Position or Vector3.new()
+    local best, bestName, bestDist = nil, nil, math.huge
+
+    for _, d in ipairs(map:GetDescendants()) do
+        if d:IsA("BasePart") or d:IsA("Model") then
+            local n = d.Name:lower()
+            local match = false
+            for _, k in ipairs(keywords) do
+                if n:find(k) then match = true break end
+            end
+            if match then
+                local cf = nil
+                if d:IsA("BasePart") then
+                    cf = d.CFrame
+                else
+                    local ok, piv = pcall(function() return d:GetPivot() end)
+                    if ok then cf = piv end
+                end
+                if cf then
+                    local dist = (basePos - cf.Position).Magnitude
+                    if dist < bestDist then
+                        bestDist = dist
+                        best = cf
+                        bestName = d:GetFullName()
+                    end
+                end
+            end
+        end
+    end
+    return best, bestName
+end
+
+local function findLabButton(centerCF)
+    local map = Workspace:FindFirstChild("Map") or Workspace
+    local radius = 90
+    local keywords = { "button", "start", "raid", "order", "pod", "tube", "chamber", "green" }
+
+    for _, d in ipairs(map:GetDescendants()) do
+        local isDetector = d:IsA("ClickDetector")
+        local isPrompt = d:IsA("ProximityPrompt")
+        if isDetector or isPrompt then
+            local part = d.Parent
+            if part and not part:IsA("BasePart") then
+                part = part.Parent
+            end
+            if part and part:IsA("BasePart") and centerCF and (part.Position - centerCF.Position).Magnitude <= radius then
+                local path = d:GetFullName():lower()
+                local match = true
+                for _, k in ipairs(keywords) do
+                    if path:find(k) then match = true break end
+                end
+                if match or isDetector then
+                    return d, part
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function insertFistOfDarkness()
+    updateStatus("Fist of Darkness lab...")
+    if currentSea() ~= 2 then
+        travelToSea(2)
+        if currentSea() ~= 2 then
+            notify("Sea 2 required for Secret Laboratory")
+            return
+        end
+    end
+
+    if not hasSpecificItem("Fist of Darkness") then
+        notify("Fist of Darkness inventory mein nahi hai")
+        return
+    end
+
+    -- Secret Laboratory dhundo (runtime object search)
+    local labCF, labName = findLabTarget()
+    if not labCF then
+        local hc = findLocationCF({ "Hot and Cold", "HotAndCold", "Secret Laboratory" }) or HotAndColdCF
+        warpTo(hc + Vector3.new(0, 60, 0))
+        task.wait(1.2)
+        labCF, labName = findLabTarget()
+    end
+
+    if not labCF then
+        notify("Secret Laboratory nahi mila - Hot and Cold pe manually check karo")
+        return
+    end
+
+    warpTo(labCF + Vector3.new(0, 5, 0))
+    task.wait(0.4)
+
+    local detector, part = findLabButton(labCF)
+    if part then
+        warpTo(part.CFrame + Vector3.new(0, 3, 0))
+        task.wait(0.3)
+    end
+
+    -- Button dabane se pehle koi tool equipped na ho
+    pcall(function()
+        if Player.Character and Player.Character:FindFirstChildOfClass("Humanoid") then
+            Player.Character.Humanoid:UnequipTools()
+        end
+    end)
+    task.wait(0.2)
+
+    if detector and detector:IsA("ClickDetector") then
+        pcall(function() fireclickdetector(detector) end)
+    elseif detector and detector:IsA("ProximityPrompt") then
+        pcall(function() fireproximityprompt(detector) end)
+    else
+        notify("Lab button nahi mila - pod ke paas green button manually dabao")
+        return
+    end
+
+    task.wait(1)
+    if hasSpecificItem("Fist of Darkness") then
+        notify("Fist abhi bhi hai - game message check karo")
+    else
+        notify("Fist processed! Ab Core Brain chahiye")
+    end
+end
+
 --================ GUI ================--
 local function buildGUI()
     local playerGui = Player:FindFirstChild("PlayerGui") or Player:WaitForChild("PlayerGui")
@@ -664,8 +805,8 @@ local function buildGUI()
     gui.Parent = playerGui
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 280, 0, 240)
-    frame.Position = UDim2.new(0.5, -140, 0.5, -120)
+    frame.Size = UDim2.new(0, 280, 0, 300)
+    frame.Position = UDim2.new(0.5, -140, 0.5, -150)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
     frame.BorderSizePixel = 0
     frame.Active = true
@@ -720,13 +861,15 @@ local function buildGUI()
     makeButton("1. Dark Arena (Sea 2)", 68, Color3.fromRGB(90, 90, 160), teleportDarkArena)
     makeButton("2. Castle on the Sea", 108, Color3.fromRGB(160, 90, 90), teleportCastleOnSea)
     makeButton("3. Safe Zone", 148, Color3.fromRGB(70, 140, 90), teleportSafeZone)
+    makeButton("4. Fist of Darkness Lab", 188, Color3.fromRGB(140, 80, 160), insertFistOfDarkness)
 
-    farmButton = makeButton("Auto Chest Farm: OFF", 188, Color3.fromRGB(220, 60, 60), function()
+    farmButton = makeButton("Auto Chest Farm: OFF", 228, Color3.fromRGB(220, 60, 60), function()
         farming = not farming
         if farming then
             visitedChests = {}
             islandTourDone = false
             islandIndex = 1
+            probeIndex = 1
             farmButton.Text = "Auto Chest Farm: ON"
             farmButton.BackgroundColor3 = Color3.fromRGB(60, 200, 90)
             updateStatus("Chest farm started")
