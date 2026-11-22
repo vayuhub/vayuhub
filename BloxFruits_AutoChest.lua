@@ -20,7 +20,8 @@ local Config = {
     AfterChestWait = 0.35,     -- wait before next chest
     NoChestWait = 2.5,         -- wait before server hop when no chest found
     IslandCheckWait = 0.6,     -- wait after moving to island anchor
-    LongDistance = 2500,       -- above this, still tweens but status shows distance
+    LongDistance = 900,        -- isse zyada door ho toh seedha warp (fast claim)
+    ProbeDistance = 500,       -- island anchor ke around itne studs check karega
     FarmButtonName = "Auto Chest Farm",
 }
 
@@ -341,6 +342,25 @@ local function tweenTo(cf)
     return finished and farming
 end
 
+local function travelToCF(cf)
+    local hrp = getHRP()
+    if not hrp or not cf then return false end
+    local dist = (hrp.Position - cf.Position).Magnitude
+    if dist < 4 then return true end
+
+    -- Door ke chests/islands ke liye direct warp taaki claim miss na ho
+    if dist > Config.LongDistance then
+        updateStatus("Warping far: " .. math.floor(dist) .. " studs")
+        setNoclip(true)
+        warpTo(cf)
+        setNoclip(false)
+        task.wait(0.15)
+        return farming
+    end
+
+    return tweenTo(cf)
+end
+
 local function openChest(chest)
     local hrp = getHRP()
     local part = getChestPart(chest)
@@ -386,6 +406,27 @@ local function refreshIslandAnchors()
             return (hrp.Position - a.CFrame.Position).Magnitude < (hrp.Position - b.CFrame.Position).Magnitude
         end)
     end
+
+    -- Har island ke around probe points banao taaki door ke chests bhi load/check ho
+    local expanded = {}
+    local d = Config.ProbeDistance
+    local offsets = {
+        Vector3.new(0, 0, 0),
+        Vector3.new(d, 0, 0),
+        Vector3.new(-d, 0, 0),
+        Vector3.new(0, 0, d),
+        Vector3.new(0, 0, -d),
+    }
+    for _, anchor in ipairs(islandAnchors) do
+        for i, off in ipairs(offsets) do
+            table.insert(expanded, {
+                Name = anchor.Name .. " #" .. i,
+                CFrame = CFrame.new(anchor.CFrame.Position + Vector3.new(off.X, 35, off.Z)),
+            })
+        end
+    end
+    islandAnchors = expanded
+
     islandIndex = 1
     islandTourDone = false
 end
@@ -423,7 +464,7 @@ local function chestFarmLoop()
             if cf then
                 visitedChests[chest] = true
                 updateStatus("Chest: " .. chest.Name)
-                tweenTo(cf)
+                travelToCF(cf)
                 if hasTargetItem() then
                     local got = hasTargetItem()
                     stopFarmForItem(got)
@@ -444,7 +485,7 @@ local function chestFarmLoop()
             if anchor then
                 updateStatus("Checking: " .. anchor.Name)
                 local target = anchor.CFrame + Vector3.new(0, 35, 0)
-                tweenTo(CFrame.new(target))
+                travelToCF(CFrame.new(target))
                 task.wait(Config.IslandCheckWait)
             else
                 updateStatus("No island anchors - hopping")
