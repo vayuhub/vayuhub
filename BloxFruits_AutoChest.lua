@@ -16,12 +16,14 @@ local getgenv = getgenv or function() return _G end
 --================ CONFIG ================--
 local Config = {
     TweenSpeed = 360,          -- studs/sec, thoda fast but still safe for most executors
+    TeleportSpeed = 1000,      -- manual teleport buttons ke liye fast tween speed
     ChestOpenWait = 0.25,      -- wait after reaching chest
     AfterChestWait = 0.35,     -- wait before next chest
     NoChestWait = 2.5,         -- wait before server hop when no chest found
     IslandCheckWait = 0.6,     -- wait after moving to island anchor
     LongDistance = 600,        -- isse zyada door ho toh seedha warp (fast claim)
-    ProbeDistance = 500,       -- island anchor ke around itne studs check karega
+    ProbeDistance = 700,       -- island anchor ke around itne studs check karega
+    AnchorMergeDistance = 700, -- isse kam door wali location ko duplicate maanega
     FarmButtonName = "Auto Chest Farm",
 }
 
@@ -48,8 +50,8 @@ local TravelRemote = {
 }
 
 --================ COORDINATES (from public scripts/wiki) ================--
-local DarkArenaCF = CFrame.new(3876.00366, 24.6882591, -3820.21777) -- Darkbeard/Dark Arena area
-local CastleOnSeaCF = CFrame.new(-5074.45556640625, 314.5155334472656, -2991.054443359375)
+local DarkArenaCF = CFrame.new(3464.7700195313, 13.375151634216, -3368.90234375) -- Dark Area / Dark Arena island (Sea 2)
+local CastleOnSeaCF = CFrame.new(-5498.0458984375, 313.79473876953, -2860.6022949219)
 local HotAndColdCF = CFrame.new(-5600, 80, -5100) -- Hot and Cold island (Secret Laboratory / FOD)
 
 local SafeZones = {
@@ -115,14 +117,18 @@ local IslandRoutes = {
     },
 }
 
---================ PROBE POINTS (6 per island) ================--
+--================ PROBE POINTS (9 per island: center + 3x3 grid) ================--
+local D = Config.ProbeDistance
 local ProbeOffsets = {
     Vector3.new(0, 0, 0),
-    Vector3.new(Config.ProbeDistance, 0, 0),
-    Vector3.new(-Config.ProbeDistance, 0, 0),
-    Vector3.new(0, 0, Config.ProbeDistance),
-    Vector3.new(0, 0, -Config.ProbeDistance),
-    Vector3.new(Config.ProbeDistance, 0, Config.ProbeDistance),
+    Vector3.new(D, 0, 0),
+    Vector3.new(-D, 0, 0),
+    Vector3.new(0, 0, D),
+    Vector3.new(0, 0, -D),
+    Vector3.new(D, 0, D),
+    Vector3.new(-D, 0, D),
+    Vector3.new(D, 0, -D),
+    Vector3.new(-D, 0, -D),
 }
 
 --================ STATE ================--
@@ -163,6 +169,28 @@ local function notify(text)
     end)
 end
 
+local probeAnchorPrev = nil
+local function setProbeAnchor(state)
+    local hrp = getHRP()
+    if not hrp then return end
+    if state then
+        if probeAnchorPrev == nil then
+            probeAnchorPrev = hrp.Anchored
+        end
+        hrp.Anchored = true
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    else
+        if probeAnchorPrev ~= nil then
+            hrp.Anchored = probeAnchorPrev
+            probeAnchorPrev = nil
+        else
+            hrp.Anchored = false
+        end
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
 local function hasTargetItem()
     local containers = { Player.Backpack, Player.Character }
     for _, container in ipairs(containers) do
@@ -183,6 +211,7 @@ local function stopFarmForItem(itemName)
         pcall(function() activeTween:Cancel() end)
         activeTween = nil
     end
+    setProbeAnchor(false)
     if farmButton then
         farmButton.Text = "Auto Chest Farm: OFF"
         farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
@@ -196,6 +225,19 @@ local function stopFarmForItem(itemName)
             notify("Safe zone: " .. cf.Name)
         end
     end)
+end
+
+local function stopFarmForTeleport()
+    farming = false
+    if activeTween then
+        pcall(function() activeTween:Cancel() end)
+        activeTween = nil
+    end
+    setProbeAnchor(false)
+    if farmButton then
+        farmButton.Text = "Auto Chest Farm: OFF"
+        farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+    end
 end
 
 local function isChestName(name)
@@ -384,17 +426,17 @@ local function setNoclip(state)
     end
 end
 
-local function tweenTo(cf)
+local function tweenTo(cf, speed, mustFinish)
     local hrp = getHRP()
     if not hrp or not cf then return false end
     local dist = (hrp.Position - cf.Position).Magnitude
     if dist < 4 then return true end
-    if dist > Config.LongDistance then
+    if dist > Config.LongDistance and not mustFinish then
         updateStatus("Long distance chest: " .. math.floor(dist) .. " studs")
     end
 
     setNoclip(true)
-    local duration = math.max(dist / Config.TweenSpeed, 0.1)
+    local duration = math.max(dist / (speed or Config.TweenSpeed), 0.1)
     if activeTween then
         pcall(function() activeTween:Cancel() end)
     end
@@ -406,16 +448,23 @@ local function tweenTo(cf)
     tween:Play()
 
     local finished = false
+    local completedOk = false
     local conn
-    conn = tween.Completed:Connect(function()
+    conn = tween.Completed:Connect(function(state)
         finished = true
+        completedOk = (state == Enum.PlaybackState.Completed)
         if conn then conn:Disconnect() end
     end)
 
-    while not finished and farming do
-        if hasTargetItem() then
-            pcall(function() tween:Cancel() end)
-            break
+    while not finished do
+        if not mustFinish then
+            if hasTargetItem() then
+                pcall(function() tween:Cancel() end)
+                break
+            end
+            if not farming then
+                break
+            end
         end
         if not hrp.Parent then break end
         task.wait(0.05)
@@ -425,7 +474,7 @@ local function tweenTo(cf)
         activeTween = nil
     end
     setNoclip(false)
-    return finished and farming
+    return finished and completedOk and (mustFinish or farming)
 end
 
 local function travelToCF(cf)
@@ -445,6 +494,29 @@ local function travelToCF(cf)
     end
 
     return tweenTo(cf)
+end
+
+local function teleportToCF(cf)
+    local hrp = getHRP()
+    if not hrp or not cf then return false end
+    local startPos = hrp.Position
+    local destPos = cf.Position
+    if (startPos - destPos).Magnitude < 5 then return true end
+
+    setProbeAnchor(false)
+    updateStatus("Teleporting...")
+
+    -- Pehle upar jao, phir high altitude se horizontally jao, phir neeche land karo.
+    -- Isse raaste mein paani/terrain se girna nahi hota.
+    local cruiseY = math.max(startPos.Y, destPos.Y) + 250
+    local ok = tweenTo(CFrame.new(startPos.X, cruiseY, startPos.Z), Config.TeleportSpeed, true)
+    if ok then
+        ok = tweenTo(CFrame.new(destPos.X, cruiseY, destPos.Z), Config.TeleportSpeed, true)
+    end
+    if ok then
+        ok = tweenTo(cf, Config.TeleportSpeed, true)
+    end
+    return ok
 end
 
 local function openChest(chest)
@@ -492,11 +564,29 @@ local function refreshIslandAnchors()
             elseif child:IsA("Model") then
                 local ok, piv = pcall(function() return child:GetPivot() end)
                 if ok then cf = piv end
+            else
+                for _, d in ipairs(child:GetDescendants()) do
+                    if d:IsA("Model") then
+                        local ok, piv = pcall(function() return d:GetPivot() end)
+                        if ok and piv then
+                            cf = piv
+                            break
+                        end
+                    end
+                end
+                if not cf then
+                    for _, d in ipairs(child:GetDescendants()) do
+                        if d:IsA("BasePart") then
+                            cf = d.CFrame
+                            break
+                        end
+                    end
+                end
             end
             if cf then
                 local isFar = true
                 for _, ex in ipairs(islandAnchors) do
-                    if (cf.Position - ex.CFrame.Position).Magnitude < 1200 then
+                    if (cf.Position - ex.CFrame.Position).Magnitude < Config.AnchorMergeDistance then
                         isFar = false
                         break
                     end
@@ -559,6 +649,7 @@ local function chestFarmLoop()
             local cf = getChestCFrame(chest)
             if cf then
                 updateStatus("Chest: " .. chest.Name)
+                setProbeAnchor(false)
                 travelToCF(cf)
                 -- Agar travel ke baad bhi chest ke paas nahi pahunche toh skip (loop na lage)
                 local hrp = getHRP()
@@ -584,8 +675,10 @@ local function chestFarmLoop()
             local probeCF, probeName = getNextProbe()
             if probeCF then
                 updateStatus("Checking: " .. probeName)
-                -- Island/probe hop ke liye direct warp taaki doosre island pe jaaye
+                -- Island/probe hop ke liye direct warp taaki doosre island pe jaaye.
+                -- Probe ke time anchor rakho taaki paani/void mein girkar na mare.
                 warpTo(probeCF)
+                setProbeAnchor(true)
                 task.wait(Config.IslandCheckWait)
             else
                 updateStatus("No island anchors - hopping")
@@ -613,10 +706,10 @@ local function findLocationCF(names)
         for _, child in ipairs(locations:GetChildren()) do
             if child.Name:lower():find(candidate:lower()) then
                 if child:IsA("BasePart") then
-                    return child.CFrame + Vector3.new(0, 10, 0)
+                    return CFrame.new(child.CFrame.Position + Vector3.new(0, 10, 0))
                 elseif child:IsA("Model") then
                     local ok, piv = pcall(function() return child:GetPivot() end)
-                    if ok then return piv + Vector3.new(0, 10, 0) end
+                    if ok and piv then return CFrame.new(piv.Position + Vector3.new(0, 10, 0)) end
                 end
             end
         end
@@ -634,6 +727,7 @@ local function travelToSea(sea)
 end
 
 local function teleportDarkArena()
+    stopFarmForTeleport()
     updateStatus("Teleporting to Dark Arena...")
     if currentSea() ~= 2 then
         travelToSea(2)
@@ -642,12 +736,13 @@ local function teleportDarkArena()
             return
         end
     end
-    local cf = findLocationCF({ "Dark Arena", "DarkArea", "Arena" }) or DarkArenaCF
-    warpTo(cf)
+    local cf = findLocationCF({ "Dark Area", "Dark Arena", "DarkArea" }) or DarkArenaCF
+    teleportToCF(cf)
     notify("Teleported to Dark Arena")
 end
 
 local function teleportCastleOnSea()
+    stopFarmForTeleport()
     updateStatus("Teleporting to Castle on the Sea...")
     if currentSea() ~= 3 then
         travelToSea(3)
@@ -656,8 +751,8 @@ local function teleportCastleOnSea()
             return
         end
     end
-    local cf = findLocationCF({ "Castle on the Sea", "Castle On The Sea", "Sea Castle", "Castle" }) or CastleOnSeaCF
-    warpTo(cf)
+    local cf = findLocationCF({ "Castle on the Sea", "Castle On The Sea", "Sea Castle", "CastleOnTheSea" }) or CastleOnSeaCF
+    teleportToCF(cf)
     notify("Teleported to Castle on the Sea")
 end
 
@@ -678,9 +773,10 @@ function nearestSafeZoneCF()
 end
 
 local function teleportSafeZone()
+    stopFarmForTeleport()
     local zone = nearestSafeZoneCF()
     if zone then
-        warpTo(zone.CFrame + Vector3.new(0, 8, 0))
+        teleportToCF(CFrame.new(zone.CFrame.Position + Vector3.new(0, 8, 0)))
         notify("Safe zone: " .. zone.Name)
     else
         notify("No safe zone found for this sea")
@@ -711,6 +807,7 @@ function serverHop()
         activeTween = nil
     end
     setNoclip(false)
+    setProbeAnchor(false)
     if farmButton then
         farmButton.Text = "Auto Chest Farm: OFF"
         farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
@@ -844,6 +941,7 @@ local function findLabButton(centerCF)
 end
 
 local function insertFistOfDarkness()
+    stopFarmForTeleport()
     updateStatus("Fist of Darkness lab...")
     if currentSea() ~= 2 then
         travelToSea(2)
@@ -996,6 +1094,7 @@ local function buildGUI()
                 pcall(function() activeTween:Cancel() end)
                 activeTween = nil
             end
+            setProbeAnchor(false)
         end
     end)
 
