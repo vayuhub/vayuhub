@@ -25,6 +25,7 @@ local Config = {
     ProbeDistance = 700,       -- island anchor ke around itne studs check karega
     AnchorMergeDistance = 700, -- isse kam door wali location ko duplicate maanega
     FarmButtonName = "Auto Chest Farm",
+    MinServerHours = 4,        -- server hop sirf itne ghante purane (4h+) servers pe karega
 }
 
 --================ TARGET ITEMS ================--
@@ -783,6 +784,48 @@ local function teleportSafeZone()
     end
 end
 
+--================ 4H+ SERVER HOP ================--
+local HOP_MARKER_FILE = "bf_4h_server_hop.txt"
+local HOP_MARKER_MAX_AGE = 900 -- marker 15 min se purana ho toh ignore (stale hop na chale)
+
+local function getServerUptimeSeconds()
+    local ok, t = pcall(function() return Workspace.DistributedGameTime end)
+    if ok and type(t) == "number" then return t end
+    return 0
+end
+
+local function writeHopMarker(farmFlag)
+    pcall(function()
+        if writefile then
+            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0"))
+        end
+    end)
+end
+
+local function clearHopMarker()
+    pcall(function()
+        if delfile and isfile and isfile(HOP_MARKER_FILE) then
+            delfile(HOP_MARKER_FILE)
+        elseif writefile then
+            writefile(HOP_MARKER_FILE, "")
+        end
+    end)
+end
+
+local function startChestFarm()
+    farming = true
+    visitedChests = {}
+    islandTourDone = false
+    islandIndex = 1
+    probeIndex = 1
+    if farmButton then
+        farmButton.Text = "Auto Chest Farm: ON"
+        farmButton.BackgroundColor3 = Color3.fromRGB(60, 200, 90)
+    end
+    updateStatus("Chest farm started")
+    task.spawn(chestFarmLoop)
+end
+
 --================ SERVER HOP ================--
 local function httpGet(url)
     if syn and syn.request then
@@ -801,6 +844,7 @@ local function httpGet(url)
 end
 
 function serverHop()
+    local wasFarming = farming
     farming = false
     if activeTween then
         pcall(function() activeTween:Cancel() end)
@@ -812,7 +856,7 @@ function serverHop()
         farmButton.Text = "Auto Chest Farm: OFF"
         farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
     end
-    updateStatus("Server hopping...")
+    updateStatus("Hopping for " .. Config.MinServerHours .. "h+ server...")
 
     -- Restricted area se bachne ke liye hop se pehle safe zone mein jao
     local hopZone = nearestSafeZoneCF()
@@ -845,6 +889,9 @@ function serverHop()
         until not cursor or cursor == "null" or #servers >= 25 or guard >= 3
     end)
 
+    -- Naye server pe pahunche toh uptime check hoga; farm chal raha tha toh wapas start hoga
+    writeHopMarker(wasFarming)
+
     if #servers > 0 then
         local chosen = servers[math.random(1, #servers)]
         local ok = pcall(function()
@@ -859,6 +906,39 @@ function serverHop()
         pcall(function()
             TeleportService:Teleport(game.PlaceId, Player)
         end)
+    end
+end
+
+-- Naye server pe script re-run hone ke baad: agar hum 4h+ hop ke beech mein the
+-- toh uptime check karo; kam hai toh dobara hop, 4h+ hai toh (chahiye toh) farm resume.
+local function checkServerHopMarker()
+    local data
+    pcall(function()
+        if readfile and isfile and isfile(HOP_MARKER_FILE) then
+            data = readfile(HOP_MARKER_FILE)
+        end
+    end)
+    if not data or data == "" then return end
+
+    local ts, farmFlag = tostring(data):match("(%d+)|(%d)")
+    ts = tonumber(ts)
+    if not ts or (os.time() - ts) > HOP_MARKER_MAX_AGE then
+        clearHopMarker()
+        return
+    end
+
+    local uptime = getServerUptimeSeconds()
+    local minUptime = Config.MinServerHours * 3600
+    if uptime >= minUptime then
+        clearHopMarker()
+        notify("Joined " .. math.floor(uptime / 3600) .. "h+ server")
+        updateStatus("4h+ server joined")
+        if farmFlag == "1" then
+            task.delay(1.5, startChestFarm)
+        end
+    else
+        updateStatus("Server " .. math.floor(uptime / 60) .. "m old - hopping again...")
+        task.delay(2, serverHop)
     end
 end
 
@@ -1017,8 +1097,8 @@ local function buildGUI()
     gui.Parent = playerGui
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 280, 0, 300)
-    frame.Position = UDim2.new(0.5, -140, 0.5, -150)
+    frame.Size = UDim2.new(0, 280, 0, 344)
+    frame.Position = UDim2.new(0.5, -140, 0.5, -172)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
     frame.BorderSizePixel = 0
     frame.Active = true
@@ -1074,19 +1154,11 @@ local function buildGUI()
     makeButton("2. Castle on the Sea", 108, Color3.fromRGB(160, 90, 90), teleportCastleOnSea)
     makeButton("3. Safe Zone", 148, Color3.fromRGB(70, 140, 90), teleportSafeZone)
     makeButton("4. Fist of Darkness Lab", 188, Color3.fromRGB(140, 80, 160), insertFistOfDarkness)
+    makeButton("5. Server Hop (4h+)", 228, Color3.fromRGB(200, 140, 40), serverHop)
 
-    farmButton = makeButton("Auto Chest Farm: OFF", 228, Color3.fromRGB(220, 60, 60), function()
-        farming = not farming
+    farmButton = makeButton("Auto Chest Farm: OFF", 268, Color3.fromRGB(220, 60, 60), function()
         if farming then
-            visitedChests = {}
-            islandTourDone = false
-            islandIndex = 1
-            probeIndex = 1
-            farmButton.Text = "Auto Chest Farm: ON"
-            farmButton.BackgroundColor3 = Color3.fromRGB(60, 200, 90)
-            updateStatus("Chest farm started")
-            task.spawn(chestFarmLoop)
-        else
+            farming = false
             farmButton.Text = "Auto Chest Farm: OFF"
             farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
             updateStatus("Chest farm stopped")
@@ -1095,6 +1167,8 @@ local function buildGUI()
                 activeTween = nil
             end
             setProbeAnchor(false)
+        else
+            startChestFarm()
         end
     end)
 
@@ -1123,5 +1197,6 @@ end
 
 --================ BOOT ================--
 buildGUI()
+checkServerHopMarker()
 updateStatus("Script loaded - press Auto Chest Farm")
 notify("Blox Fruits mod menu loaded")
