@@ -198,19 +198,36 @@ local function stopFarmForItem(itemName)
     end)
 end
 
-local function isChestObject(obj)
-    if not obj then return false end
-    local name = obj.Name:lower()
-    if not name:find("chest") then return false end
-    if obj:IsA("Model") then return true end
-    if obj:IsA("BasePart") then
-        local parent = obj.Parent
-        if parent and parent.Name:lower():find("chest") then
-            return false
+local function isChestName(name)
+    return name:lower():find("chest", 1, true) ~= nil
+end
+
+local function isExactChestName(name)
+    return name:lower():match("^chest%d+$") ~= nil
+end
+
+local function hasChestInteraction(obj)
+    if not obj:IsA("BasePart") then return false end
+    return obj:FindFirstChild("TouchInterest") ~= nil
+        or obj:FindFirstChildOfClass("ClickDetector") ~= nil
+        or obj:FindFirstChildOfClass("ProximityPrompt") ~= nil
+end
+
+local function instanceHasChestInteraction(root)
+    if hasChestInteraction(root) then return true end
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("ClickDetector") or d:IsA("ProximityPrompt") then
+            return true
         end
-        return true
+        if hasChestInteraction(d) then
+            return true
+        end
     end
     return false
+end
+
+local function isChestTriggerPart(obj)
+    return obj:IsA("BasePart") and isChestName(obj.Name) and hasChestInteraction(obj)
 end
 
 local function getChestPart(chest)
@@ -218,6 +235,11 @@ local function getChestPart(chest)
         return chest
     end
     if chest:IsA("Model") then
+        for _, d in ipairs(chest:GetDescendants()) do
+            if hasChestInteraction(d) then
+                return d
+            end
+        end
         if chest.PrimaryPart then
             return chest.PrimaryPart
         end
@@ -247,28 +269,79 @@ end
 local function getChests()
     local chests = {}
     local seen = {}
-    local function add(obj)
-        if isChestObject(obj) and getChestPart(obj) and not seen[obj] and not visitedChests[obj] then
-            seen[obj] = true
-            table.insert(chests, obj)
-        end
-    end
-
     local chestModels = Workspace:FindFirstChild("ChestModels")
-    if chestModels then
-        for _, c in ipairs(chestModels:GetChildren()) do
-            add(c)
+
+    local function inChestModels(inst)
+        if chestModels ~= nil and inst:IsDescendantOf(chestModels) then return true end
+        local p = inst.Parent
+        while p and p ~= Workspace do
+            local n = p.Name:lower()
+            if n == "chestmodels" or n == "chests" or n == "chest" then
+                return true
+            end
+            p = p.Parent
+        end
+        return false
+    end
+
+    local function add(obj)
+        if not obj or seen[obj] or visitedChests[obj] then return end
+        if not getChestPart(obj) then return end
+        seen[obj] = true
+        table.insert(chests, obj)
+    end
+
+    -- Actual chest parts (Chest1/Chest2/Chest3 etc.) can be nested anywhere in Workspace
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and isChestName(obj.Name) then
+            if isExactChestName(obj.Name) or hasChestInteraction(obj) then
+                add(obj)
+            end
+        elseif obj:IsA("Model") and isChestName(obj.Name) then
+            local triggerCount = 0
+            for _, d in ipairs(obj:GetDescendants()) do
+                if isChestTriggerPart(d) then
+                    triggerCount += 1
+                end
+            end
+            if triggerCount <= 1 and (inChestModels(obj) or instanceHasChestInteraction(obj)) then
+                add(obj)
+            end
         end
     end
 
-    -- Chests are normally direct children of Workspace or inside ChestModels
-    for _, child in ipairs(Workspace:GetChildren()) do
-        if isChestObject(child) then
-            add(child)
+    -- Same chest ke model/part duplicates ko position se merge karo, trigger part prefer karo
+    local function score(obj)
+        if obj:IsA("BasePart") then return 3 end
+        if instanceHasChestInteraction(obj) then return 2 end
+        return 1
+    end
+
+    table.sort(chests, function(a, b)
+        local sa, sb = score(a), score(b)
+        if sa ~= sb then return sa > sb end
+        return tostring(a) < tostring(b)
+    end)
+
+    local deduped = {}
+    for _, obj in ipairs(chests) do
+        local cf = getChestCFrame(obj)
+        local duplicate = false
+        if cf then
+            for _, kept in ipairs(deduped) do
+                local kcf = getChestCFrame(kept)
+                if kcf and (cf.Position - kcf.Position).Magnitude <= 30 then
+                    duplicate = true
+                    break
+                end
+            end
+        end
+        if not duplicate then
+            table.insert(deduped, obj)
         end
     end
 
-    return chests
+    return deduped
 end
 
 local function getNearestChest()
@@ -385,6 +458,15 @@ local function openChest(chest)
             end
         end)
     end
+    pcall(function()
+        for _, d in ipairs(chest:GetDescendants()) do
+            if d:IsA("ClickDetector") then
+                pcall(function() fireclickdetector(d) end)
+            elseif d:IsA("ProximityPrompt") then
+                pcall(function() fireproximityprompt(d) end)
+            end
+        end
+    end)
     task.wait(Config.ChestOpenWait)
 end
 
@@ -628,11 +710,20 @@ function serverHop()
         pcall(function() activeTween:Cancel() end)
         activeTween = nil
     end
+    setNoclip(false)
     if farmButton then
         farmButton.Text = "Auto Chest Farm: OFF"
         farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
     end
     updateStatus("Server hopping...")
+
+    -- Restricted area se bachne ke liye hop se pehle safe zone mein jao
+    local hopZone = nearestSafeZoneCF()
+    if hopZone then
+        updateStatus("Safe zone before hop...")
+        warpTo(hopZone.CFrame + Vector3.new(0, 8, 0))
+        task.wait(0.8)
+    end
 
     local servers = {}
     pcall(function()
@@ -659,9 +750,14 @@ function serverHop()
 
     if #servers > 0 then
         local chosen = servers[math.random(1, #servers)]
-        pcall(function()
+        local ok = pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen, Player)
         end)
+        if not ok then
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, Player)
+            end)
+        end
     else
         pcall(function()
             TeleportService:Teleport(game.PlaceId, Player)
