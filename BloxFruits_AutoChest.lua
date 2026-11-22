@@ -486,12 +486,13 @@ local function travelToCF(cf)
     local dist = (hrp.Position - cf.Position).Magnitude
     if dist < 4 then return true end
 
-    -- Door ke chests/islands ke liye direct warp taaki claim miss na ho
+    -- Door ke chests/islands ke liye fast tween taaki claim miss na ho.
+    -- Instant warp anti-cheat ko teleport lagta hai (position reset / restricted area),
+    -- isliye frame-by-frame movement use karo.
     if dist > Config.LongDistance then
-        updateStatus("Warping far: " .. math.floor(dist) .. " studs")
-        setNoclip(true)
-        warpTo(cf)
-        setNoclip(false)
+        updateStatus("Traveling far: " .. math.floor(dist) .. " studs")
+        local speed = math.clamp(dist / 4, Config.TeleportSpeed, 1400)
+        tweenTo(cf, speed, true)
         task.wait(0.15)
         return farming
     end
@@ -678,9 +679,9 @@ local function chestFarmLoop()
             local probeCF, probeName = getNextProbe()
             if probeCF then
                 updateStatus("Checking: " .. probeName)
-                -- Island/probe hop ke liye direct warp taaki doosre island pe jaaye.
+                -- Island/probe ke liye fast tween - instant warp anti-cheat reset kar deta hai.
                 -- Probe ke time anchor rakho taaki paani/void mein girkar na mare.
-                warpTo(probeCF)
+                tweenTo(probeCF, 800, true)
                 setProbeAnchor(true)
                 task.wait(Config.IslandCheckWait)
             else
@@ -1032,14 +1033,21 @@ function serverHop()
 
     if #servers > 0 then
         local chosen = servers[math.random(1, #servers)]
-        local ok = pcall(function()
+        local oldJob = game.JobId
+        pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen, Player)
         end)
-        if not ok then
-            pcall(function()
-                TeleportService:Teleport(game.PlaceId, Player)
-            end)
-        end
+        -- TeleportToPlaceInstance async fail ho sakta hai (error 773 - restricted).
+        -- pcall ise catch nahi karta, isliye thode der baad check karo:
+        -- agar wahi server pe ho toh random server pe chalo.
+        task.delay(6, function()
+            if game.JobId == oldJob and getHRP() then
+                updateStatus("JobId teleport failed - random server hop...")
+                pcall(function()
+                    TeleportService:Teleport(game.PlaceId, Player)
+                end)
+            end
+        end)
     else
         pcall(function()
             TeleportService:Teleport(game.PlaceId, Player)
