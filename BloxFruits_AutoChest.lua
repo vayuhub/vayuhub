@@ -20,7 +20,7 @@ local Config = {
     AfterChestWait = 0.35,     -- wait before next chest
     NoChestWait = 2.5,         -- wait before server hop when no chest found
     IslandCheckWait = 0.6,     -- wait after moving to island anchor
-    LongDistance = 900,        -- isse zyada door ho toh seedha warp (fast claim)
+    LongDistance = 600,        -- isse zyada door ho toh seedha warp (fast claim)
     ProbeDistance = 500,       -- island anchor ke around itne studs check karega
     FarmButtonName = "Auto Chest Farm",
 }
@@ -393,6 +393,14 @@ local function refreshIslandAnchors()
     local sea = currentSea()
     local hrp = getHRP()
 
+    -- Pehle current sea ke known island routes use karo (saare islands cover hote hain)
+    if sea and IslandRoutes[sea] then
+        for _, a in ipairs(IslandRoutes[sea]) do
+            table.insert(islandAnchors, { Name = a.Name, CFrame = a.CFrame })
+        end
+    end
+
+    -- _WorldOrigin.Locations se sirf wo anchors add karo jo known islands se door hain
     local locations = Workspace:FindFirstChild("_WorldOrigin") and Workspace._WorldOrigin:FindFirstChild("Locations")
     if locations then
         for _, child in ipairs(locations:GetChildren()) do
@@ -404,14 +412,18 @@ local function refreshIslandAnchors()
                 if ok then cf = piv end
             end
             if cf then
-                table.insert(islandAnchors, { Name = child.Name, CFrame = cf })
+                local isFar = true
+                for _, ex in ipairs(islandAnchors) do
+                    if (cf.Position - ex.CFrame.Position).Magnitude < 1200 then
+                        isFar = false
+                        break
+                    end
+                end
+                if isFar then
+                    table.insert(islandAnchors, { Name = child.Name, CFrame = cf })
+                end
             end
         end
-    end
-
-    -- If world origin has too few/no anchors, use hardcoded route for current sea
-    if #islandAnchors < 3 and sea and IslandRoutes[sea] then
-        islandAnchors = IslandRoutes[sea]
     end
 
     if hrp and #islandAnchors > 0 then
@@ -461,11 +473,16 @@ local function chestFarmLoop()
 
         local chest = getNearestChest()
         if chest then
+            visitedChests[chest] = true
             local cf = getChestCFrame(chest)
             if cf then
-                visitedChests[chest] = true
                 updateStatus("Chest: " .. chest.Name)
                 travelToCF(cf)
+                -- Agar travel ke baad bhi chest ke paas nahi pahunche toh skip (loop na lage)
+                local hrp = getHRP()
+                if hrp and (hrp.Position - cf.Position).Magnitude > 150 then
+                    task.wait(0.2)
+                end
                 if hasTargetItem() then
                     local got = hasTargetItem()
                     stopFarmForItem(got)
@@ -485,7 +502,8 @@ local function chestFarmLoop()
             local probeCF, probeName = getNextProbe()
             if probeCF then
                 updateStatus("Checking: " .. probeName)
-                travelToCF(probeCF)
+                -- Island/probe hop ke liye direct warp taaki doosre island pe jaaye
+                warpTo(probeCF)
                 task.wait(Config.IslandCheckWait)
             else
                 updateStatus("No island anchors - hopping")
