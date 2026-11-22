@@ -142,6 +142,7 @@ local islandTourDone = false
 local activeTween = nil
 local statusLabel = nil
 local farmButton = nil
+local serverAgeLabel = nil
 
 --================ HELPERS ================--
 local function getHRP()
@@ -794,6 +795,32 @@ local function getServerUptimeSeconds()
     return 0
 end
 
+local function formatUptime(seconds)
+    seconds = math.floor(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = seconds % 60
+    if h > 0 then
+        return string.format("%dh %dm %ds", h, m, s)
+    elseif m > 0 then
+        return string.format("%dm %ds", m, s)
+    end
+    return string.format("%ds", s)
+end
+
+-- Naye server pe character load hone ka wait karta hai (restricted area se bachne ke liye)
+local function waitForCharacter(timeout)
+    local elapsed = 0
+    while elapsed < (timeout or 20) do
+        if game:IsLoaded() and getHRP() then
+            return true
+        end
+        task.wait(0.5)
+        elapsed += 0.5
+    end
+    return game:IsLoaded() and getHRP() ~= nil
+end
+
 local function writeHopMarker(farmFlag)
     pcall(function()
         if writefile then
@@ -927,19 +954,39 @@ local function checkServerHopMarker()
         return
     end
 
-    local uptime = getServerUptimeSeconds()
-    local minUptime = Config.MinServerHours * 3600
-    if uptime >= minUptime then
-        clearHopMarker()
-        notify("Joined " .. math.floor(uptime / 3600) .. "h+ server")
-        updateStatus("4h+ server joined")
-        if farmFlag == "1" then
-            task.delay(1.5, startChestFarm)
+    task.spawn(function()
+        -- Pehle character fully load hone do; warna hop ke turant baad warp karne se
+        -- game "restricted area" bhej deta hai
+        if not waitForCharacter(25) then
+            updateStatus("Character not loaded yet - waiting...")
         end
-    else
-        updateStatus("Server " .. math.floor(uptime / 60) .. "m old - hopping again...")
-        task.delay(2, serverHop)
-    end
+        task.wait(1.5)
+
+        local uptime = getServerUptimeSeconds()
+        local minUptime = Config.MinServerHours * 3600
+        if uptime >= minUptime then
+            clearHopMarker()
+            notify("Joined " .. math.floor(uptime / 3600) .. "h+ server")
+            updateStatus("4h+ server joined")
+            if farmFlag == "1" then
+                -- Anti-cheat settle hone ka time do, phir hi farm resume karo
+                task.delay(4, function()
+                    if waitForCharacter(10) then
+                        startChestFarm()
+                    else
+                        updateStatus("Character load nahi hua - farm manually start karo")
+                    end
+                end)
+            end
+        else
+            updateStatus("Server " .. math.floor(uptime / 60) .. "m old - hopping again...")
+            task.delay(2.5, function()
+                if waitForCharacter(15) then
+                    serverHop()
+                end
+            end)
+        end
+    end)
 end
 
 --================ FIST OF DARKNESS / SECRET LAB ================--
@@ -1169,6 +1216,24 @@ local function buildGUI()
             setProbeAnchor(false)
         else
             startChestFarm()
+        end
+    end)
+
+    serverAgeLabel = Instance.new("TextLabel")
+    serverAgeLabel.Size = UDim2.new(1, -20, 0, 16)
+    serverAgeLabel.Position = UDim2.new(0, 10, 0, 308)
+    serverAgeLabel.BackgroundTransparency = 1
+    serverAgeLabel.Text = "Server Age: --"
+    serverAgeLabel.TextColor3 = Color3.fromRGB(140, 220, 160)
+    serverAgeLabel.Font = Enum.Font.Gotham
+    serverAgeLabel.TextSize = 12
+    serverAgeLabel.TextXAlignment = Enum.TextXAlignment.Left
+    serverAgeLabel.Parent = frame
+
+    task.spawn(function()
+        while serverAgeLabel and serverAgeLabel.Parent do
+            serverAgeLabel.Text = "Server Age: " .. formatUptime(getServerUptimeSeconds())
+            task.wait(1)
         end
     end)
 
