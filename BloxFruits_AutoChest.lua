@@ -1408,6 +1408,32 @@ local function buildGUI()
     end)
 end
 
+--================ MANUAL MOVEMENT OVERRIDE ================--
+-- User khud move kare (air travel etc.) toh active tween cancel + probe anchor hatado,
+-- warna tween player ko wapas apne target ki taraf kheenchta rehta hai.
+local function releaseMovementControl()
+    if activeTween then
+        pcall(function() activeTween:Cancel() end)
+        activeTween = nil
+    end
+    setProbeAnchor(false)
+end
+
+UserInputService.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    local kc = input.KeyCode
+    if kc == Enum.KeyCode.W or kc == Enum.KeyCode.A or kc == Enum.KeyCode.S or kc == Enum.KeyCode.D
+        or kc == Enum.KeyCode.Space or kc == Enum.KeyCode.LeftShift then
+        releaseMovementControl()
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Thumbstick1 and input.Position.Magnitude > 0.35 then
+        releaseMovementControl()
+    end
+end)
+
 --================ BOOT ================--
 buildGUI()
 checkServerHopMarker()
