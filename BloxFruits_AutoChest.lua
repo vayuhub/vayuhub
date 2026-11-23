@@ -14,8 +14,8 @@ local getgenv = getgenv or function() return _G end
 
 --================ CONFIG ================--
 local Config = {
-    TweenSpeed = 360,          -- studs/sec, thoda fast but still safe for most executors
-    TeleportSpeed = 1000,      -- manual teleport buttons ke liye fast tween speed
+    TweenSpeed = 350,          -- studs/sec, safe for anti-cheat
+    TeleportSpeed = 350,       -- manual teleport buttons ke liye safe tween speed (anti-cheat safe)
     ChestOpenWait = 0.4,       -- wait after reaching chest
     AfterChestWait = 0.5,      -- wait before next chest
     NoChestWait = 2.5,         -- wait before server hop when no chest found
@@ -23,8 +23,8 @@ local Config = {
     LongDistance = 600,        -- isse zyada door ho toh fast travel (far chest)
     ProbeDistance = 700,       -- island anchor ke around itne studs check karega
     AnchorMergeDistance = 700, -- isse kam door wali location ko duplicate maanega
-    ProbeSpeed = 500,          -- island probe tween speed (slow = anti-cheat safe)
-    FarTravelSpeed = 800,      -- bahut door ke chest tak ki max tween speed
+    ProbeSpeed = 350,          -- island probe tween speed (slow = anti-cheat safe)
+    FarTravelSpeed = 360,      -- door ke chest tak ki max tween speed (anti-cheat safe)
     ChestArriveDistance = 120, -- itne se zyada door ho toh chest claim skip (retry allowed)
     MaxChestAttempts = 2,      -- ek chest ko max itni baar try karega
     FarmButtonName = "Auto Chest Farm",
@@ -46,6 +46,12 @@ local SeaByPlace = {
     [85211729168715] = 1,
     [79091703265657] = 2,
     [100117331123089] = 3,
+}
+
+local SeaPlaceMap = {
+    [1] = 2753915549,
+    [2] = 4442272183,
+    [3] = 7449423635,
 }
 local TravelRemote = {
     [1] = "TravelMain",
@@ -513,15 +519,15 @@ local function teleportToCF(cf)
     setProbeAnchor(false)
     updateStatus("Teleporting...")
 
-    -- Pehle upar jao, phir high altitude se horizontally jao, phir neeche land karo.
-    -- Isse raaste mein paani/terrain se girna nahi hota.
-    local cruiseY = math.max(startPos.Y, destPos.Y) + 250
-    local ok = tweenTo(CFrame.new(startPos.X, cruiseY, startPos.Z), Config.TeleportSpeed, true)
+    -- Anti-cheat safe cruise altitude & speed (350 studs/sec max)
+    local safeSpeed = math.min(Config.TeleportSpeed or 350, 360)
+    local cruiseY = math.max(startPos.Y, destPos.Y) + 200
+    local ok = tweenTo(CFrame.new(startPos.X, cruiseY, startPos.Z), safeSpeed, true)
     if ok then
-        ok = tweenTo(CFrame.new(destPos.X, cruiseY, destPos.Z), Config.TeleportSpeed, true)
+        ok = tweenTo(CFrame.new(destPos.X, cruiseY, destPos.Z), safeSpeed, true)
     end
     if ok then
-        ok = tweenTo(cf, Config.TeleportSpeed, true)
+        ok = tweenTo(cf, safeSpeed, true)
     end
     return ok
 end
@@ -709,9 +715,14 @@ end
 --================ TELEPORT HELPERS ================--
 function warpTo(cf)
     local hrp = getHRP()
-    if hrp and cf then
+    if not hrp or not cf then return false end
+    local dist = (hrp.Position - cf.Position).Magnitude
+    if dist <= 15 then
         hrp.CFrame = cf
+        return true
     end
+    -- Over distance: use smooth tweenTo with noclip to prevent Blox Fruits anti-cheat rollback
+    return tweenTo(cf, Config.TweenSpeed or 350, true)
 end
 
 local function findLocationCF(names)
@@ -955,14 +966,12 @@ local function startChestFarm()
     task.spawn(chestFarmLoop)
 end
 
---================ SERVER HOP (FIXED V5 - ANTI 773 / INSTANCE HOP) ================--
+--================ SERVER HOP (FIXED V5 - ANTI 773 & ANTI ROLLBACK) ================--
 local HOP_INTERVAL       = Config.AutoHopInterval or 65
 local RETRY_DELAY        = 4
 local FLOOD_RETRY_DELAY  = 8
 local MAX_RETRIES        = 12
-local SAFE_ZONE_OFFSET   = 8
-local SAFE_ZONE_RETRIES  = 5
-local LANDING_SETTLE     = 3
+local LANDING_SETTLE     = 2
 local CHAR_LOAD_TIMEOUT  = 30
 
 local HOP_MARKER_FILE       = "bf_hop_marker.txt"
@@ -1054,42 +1063,49 @@ local function fetchServers(placeId)
     updateStatus("Fetching servers from API...")
 
     local candidates = {}
-    local cursor = ""
-    local maxPages = 4
+    local placeIdStr = tostring(placeId)
+    local seaRootId = SeaPlaceMap and SeaPlaceMap[currentSea()]
+    local idList = { placeIdStr }
+    if seaRootId and tostring(seaRootId) ~= placeIdStr then
+        table.insert(idList, tostring(seaRootId))
+    end
 
-    for page = 1, maxPages do
-        local url = string.format(
-            "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
-            placeId,
-            (cursor and cursor ~= "" and cursor ~= "null") and ("&cursor=" .. cursor) or ""
-        )
+    local endpoints = {
+        "https://games.roproxy.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100",
+        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100",
+        "https://games.roproxy.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100",
+        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100",
+    }
 
-        local body = httpRequest(url)
-        if not body then break end
+    for _, targetId in ipairs(idList) do
+        for _, endpointTemplate in ipairs(endpoints) do
+            local url = string.format(endpointTemplate, targetId)
+            local body = httpRequest(url)
 
-        local parsed = nil
-        pcall(function()
-            parsed = HttpService:JSONDecode(body)
-        end)
+            if body and body ~= "" then
+                local parsed = nil
+                pcall(function()
+                    parsed = HttpService:JSONDecode(body)
+                end)
 
-        if not parsed or not parsed.data then break end
+                if parsed and parsed.data and #parsed.data > 0 then
+                    for _, s in ipairs(parsed.data) do
+                        local sId = tostring(s.id)
+                        local playing = tonumber(s.playing) or 0
+                        local maxP = tonumber(s.maxPlayers) or 12
 
-        for _, s in ipairs(parsed.data) do
-            local sId = tostring(s.id)
-            local playing = tonumber(s.playing) or 0
-            local maxP = tonumber(s.maxPlayers) or 12
+                        if sId ~= game.JobId and playing > 0 and playing < maxP then
+                            if not visitedServers[sId] then
+                                table.insert(candidates, { id = sId, place = tonumber(targetId) or placeId })
+                            end
+                        end
+                    end
 
-            if sId ~= game.JobId and playing > 0 and playing <= (maxP - 1) then
-                if not visitedServers[sId] then
-                    table.insert(candidates, sId)
+                    if #candidates >= 10 then break end
                 end
             end
         end
-
-        cursor = parsed.nextPageCursor
-        if not cursor or cursor == "null" or #candidates >= 30 then
-            break
-        end
+        if #candidates >= 10 then break end
     end
 
     if #candidates == 0 then
@@ -1097,22 +1113,30 @@ local function fetchServers(placeId)
         visitedServers = { [tostring(game.JobId)] = os.time() }
         saveVisitedServers()
 
-        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", placeId)
-        local body = httpRequest(url)
-        if body then
-            pcall(function()
-                local parsed = HttpService:JSONDecode(body)
-                if parsed and parsed.data then
-                    for _, s in ipairs(parsed.data) do
-                        local sId = tostring(s.id)
-                        local playing = tonumber(s.playing) or 0
-                        local maxP = tonumber(s.maxPlayers) or 12
-                        if sId ~= game.JobId and playing > 0 and playing < maxP then
-                            table.insert(candidates, sId)
+        for _, targetId in ipairs(idList) do
+            local url = string.format("https://games.roproxy.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100", targetId)
+            local body = httpRequest(url)
+            if not body or body == "" then
+                url = string.format("https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100", targetId)
+                body = httpRequest(url)
+            end
+
+            if body and body ~= "" then
+                pcall(function()
+                    local parsed = HttpService:JSONDecode(body)
+                    if parsed and parsed.data then
+                        for _, s in ipairs(parsed.data) do
+                            local sId = tostring(s.id)
+                            local playing = tonumber(s.playing) or 0
+                            local maxP = tonumber(s.maxPlayers) or 12
+                            if sId ~= game.JobId and playing > 0 and playing < maxP then
+                                table.insert(candidates, { id = sId, place = tonumber(targetId) or placeId })
+                            end
                         end
                     end
-                end
-            end)
+                end)
+            end
+            if #candidates > 0 then break end
         end
     end
 
@@ -1133,45 +1157,6 @@ local function queueReExecution()
     end
 end
 
-local function forceIntoSafeZone(reason)
-    for attempt = 1, SAFE_ZONE_RETRIES do
-        local hrp = getHRP()
-        if not hrp then
-            task.wait(0.5)
-            continue
-        end
-
-        local zone = nearestSafeZoneCF()
-        if not zone then
-            if attempt < SAFE_ZONE_RETRIES then
-                task.wait(1)
-                continue
-            end
-            warn("[Hop] Safe zone not found - " .. (reason or ""))
-            return false
-        end
-
-        pcall(function() setNoclip(true) end)
-        pcall(function() setProbeAnchor(true) end)
-
-        local targetCF = zone.CFrame + Vector3.new(0, SAFE_ZONE_OFFSET, 0)
-        warpTo(targetCF)
-        task.wait(0.3)
-        warpTo(targetCF)
-        task.wait(0.2)
-
-        pcall(function() setProbeAnchor(false) end)
-        pcall(function() setNoclip(false) end)
-
-        updateStatus("Safe zone ✓ - " .. (reason or ""))
-        return true
-    end
-
-    pcall(function() setProbeAnchor(false) end)
-    pcall(function() setNoclip(false) end)
-    return false
-end
-
 -- TeleportToPlaceInstance directly to public server instance
 -- NEVER calls Teleport(game.PlaceId) to prevent Error 773 (Restricted place)
 local function fireTeleport()
@@ -1181,14 +1166,32 @@ local function fireTeleport()
 
     if #serverCandidates == 0 then
         warn("[Hop] No candidate servers available")
-        updateStatus("No available server found, retrying in 3s...")
+        updateStatus("No servers found - retrying in 4s...")
+        -- Reset isHopping so script doesn't stay permanently locked!
+        task.delay(4, function()
+            if isHopping then
+                fetchServers(game.PlaceId)
+                if #serverCandidates > 0 then
+                    fireTeleport()
+                else
+                    isHopping = false
+                    updateStatus("Hop retry failed - check internet")
+                    pcall(function()
+                        setProbeAnchor(false)
+                        setNoclip(false)
+                    end)
+                end
+            end
+        end)
         return false
     end
 
     local randomIndex = math.random(1, #serverCandidates)
-    local targetJobId = table.remove(serverCandidates, randomIndex)
-    currentHopJobId = targetJobId
+    local targetServer = table.remove(serverCandidates, randomIndex)
+    local targetJobId = targetServer.id
+    local targetPlaceId = targetServer.place or game.PlaceId
 
+    currentHopJobId = targetJobId
     recordVisitedServer(targetJobId)
     updateStatus(string.format("Teleporting to server... (%d in queue)", #serverCandidates))
 
@@ -1196,16 +1199,22 @@ local function fireTeleport()
 
     local oldJobId = game.JobId
     local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(game.PlaceId, targetJobId, Player)
+        TeleportService:TeleportToPlaceInstance(targetPlaceId, targetJobId, Player)
     end)
 
     if not ok then
         warn("[Hop] TeleportToPlaceInstance call failed:", tostring(err))
+        updateStatus("Teleport call failed - trying next server...")
+        task.delay(2, function()
+            if isHopping then
+                fireTeleport()
+            end
+        end)
         return false
     end
 
-    -- Watchdog: Agar 12s tak Roblox teleport na kare, next server try karo
-    task.delay(12, function()
+    -- Watchdog: Agar 10s tak Roblox teleport na kare, next server try karo
+    task.delay(10, function()
         if isHopping and game.JobId == oldJobId then
             warn("[Hop] Teleport timed out (stuck in same server), picking next...")
             retryCount += 1
@@ -1217,6 +1226,11 @@ local function fireTeleport()
                 retryCount = 0
                 clearHopMarker()
                 notify("Hop failed after timeout retries")
+                updateStatus("Ready")
+                pcall(function()
+                    setProbeAnchor(false)
+                    setNoclip(false)
+                end)
             end
         end
     end)
@@ -1237,10 +1251,9 @@ TeleportService.TeleportInitFailed:Connect(function(player, teleportResult)
         retryCount = 0
         clearHopMarker()
         notify("Hop failed after " .. MAX_RETRIES .. " retries - next cycle mein try hoga")
-        task.delay(1, function()
-            if getHRP() then
-                forceIntoSafeZone("after max retries")
-            end
+        pcall(function()
+            setProbeAnchor(false)
+            setNoclip(false)
         end)
         return
     end
@@ -1255,10 +1268,6 @@ TeleportService.TeleportInitFailed:Connect(function(player, teleportResult)
 
     task.delay(delay, function()
         if not isHopping then return end
-        if getHRP() then
-            forceIntoSafeZone("before retry")
-            task.wait(0.5)
-        end
         updateStatus(string.format("Retrying hop... (%d/%d)", retryCount, MAX_RETRIES))
         fireTeleport()
     end)
@@ -1287,8 +1296,11 @@ function serverHop()
 
     updateStatus("Preparing hop...")
 
-    forceIntoSafeZone("before hop")
-    task.wait(0.5)
+    -- Anti-cheat safe: anchor character in place with noclip (NO instant warping that causes rubberbanding!)
+    pcall(function()
+        setNoclip(true)
+        setProbeAnchor(true)
+    end)
 
     writeHopMarker(wasFarming)
 
@@ -1373,55 +1385,27 @@ local function checkServerHopMarker()
 
         pcall(function() setProbeAnchor(true) end)
         pcall(function() setNoclip(true) end)
-        task.wait(0.3)
+        task.wait(0.5)
 
-        updateStatus("Warping to safe zone...")
-        for attempt = 1, SAFE_ZONE_RETRIES do
-            local zone = nearestSafeZoneCF()
-            local hrp = getHRP()
-            if zone and hrp then
-                local targetCF = zone.CFrame + Vector3.new(0, SAFE_ZONE_OFFSET, 0)
-                warpTo(targetCF)
-                task.wait(0.3)
-                warpTo(targetCF)
-                break
-            end
-            task.wait(1)
-        end
-
-        updateStatus("Settling...")
+        updateStatus("Settling in server...")
         task.wait(LANDING_SETTLE)
 
         pcall(function() setProbeAnchor(false) end)
-        task.wait(0.2)
         pcall(function() setNoclip(false) end)
-
-        task.wait(0.5)
-        local hrpCheck = getHRP()
-        if hrpCheck then
-            local finalZone = nearestSafeZoneCF()
-            if finalZone then
-                local dist = (hrpCheck.Position - finalZone.CFrame.Position).Magnitude
-                if dist > 100 then
-                    updateStatus("Position reset - fixing...")
-                    forceIntoSafeZone("post-settle fix")
-                    task.wait(1)
-                end
-            end
-        end
 
         notify("Server joined!")
         updateStatus("Ready")
         isHopping = false
 
         if farmFlag == "1" then
-            task.delay(3, function()
+            task.delay(2, function()
                 if waitForCharacter(10) then
                     startChestFarm()
                 end
             end)
         end
     end)
+end
 end
 
 --================ FIST OF DARKNESS / SECRET LAB ================--
