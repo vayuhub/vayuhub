@@ -955,21 +955,26 @@ local function startChestFarm()
     task.spawn(chestFarmLoop)
 end
 
---================ SERVER HOP (FIXED V4) ================--
+--================ SERVER HOP (FIXED V5 - ANTI 773 / INSTANCE HOP) ================--
 local HOP_INTERVAL       = Config.AutoHopInterval or 65
-local RETRY_DELAY        = 5
-local FLOOD_RETRY_DELAY  = 10
-local MAX_RETRIES        = 10
+local RETRY_DELAY        = 4
+local FLOOD_RETRY_DELAY  = 8
+local MAX_RETRIES        = 12
 local SAFE_ZONE_OFFSET   = 8
 local SAFE_ZONE_RETRIES  = 5
 local LANDING_SETTLE     = 3
 local CHAR_LOAD_TIMEOUT  = 30
 
-local HOP_MARKER_FILE    = "bf_hop_marker.txt"
-local HOP_MARKER_MAX_AGE = 900
+local HOP_MARKER_FILE       = "bf_hop_marker.txt"
+local HOP_MARKER_MAX_AGE    = 900
+local VISITED_SERVERS_FILE  = "bf_visited_servers.json"
 
-local isHopping  = false
-local retryCount = 0
+local isHopping          = false
+local retryCount         = 0
+local serverCandidates   = {}
+local visitedServers     = {}
+local isFetchingServers  = false
+local currentHopJobId    = nil
 
 local function writeHopMarker(farmFlag)
     pcall(function()
@@ -987,6 +992,145 @@ local function clearHopMarker()
             writefile(HOP_MARKER_FILE, "")
         end
     end)
+end
+
+local function httpRequest(url)
+    local fn = (syn and syn.request) 
+        or (http and http.request) 
+        or http_request 
+        or (fluxus and fluxus.request) 
+        or request
+    if fn then
+        local ok, res = pcall(fn, { Url = url, Method = "GET" })
+        if ok and res and res.Body then
+            return res.Body
+        end
+    end
+    local ok, res = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and res then
+        return res
+    end
+    return nil
+end
+
+local function loadVisitedServers()
+    pcall(function()
+        if readfile and isfile and isfile(VISITED_SERVERS_FILE) then
+            local data = HttpService:JSONDecode(readfile(VISITED_SERVERS_FILE))
+            if type(data) == "table" then
+                local now = os.time()
+                for id, t in pairs(data) do
+                    if (now - (tonumber(t) or 0)) < 1800 then
+                        visitedServers[tostring(id)] = tonumber(t)
+                    end
+                end
+            end
+        end
+    end)
+    visitedServers[tostring(game.JobId)] = os.time()
+end
+
+local function saveVisitedServers()
+    pcall(function()
+        if writefile then
+            writefile(VISITED_SERVERS_FILE, HttpService:JSONEncode(visitedServers))
+        end
+    end)
+end
+
+local function recordVisitedServer(jobId)
+    if not jobId then return end
+    visitedServers[tostring(jobId)] = os.time()
+    saveVisitedServers()
+end
+
+loadVisitedServers()
+
+local function fetchServers(placeId)
+    if isFetchingServers then return false end
+    isFetchingServers = true
+    updateStatus("Fetching servers from API...")
+
+    local candidates = {}
+    local cursor = ""
+    local maxPages = 4
+
+    for page = 1, maxPages do
+        local url = string.format(
+            "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100%s",
+            placeId,
+            (cursor and cursor ~= "" and cursor ~= "null") and ("&cursor=" .. cursor) or ""
+        )
+
+        local body = httpRequest(url)
+        if not body then break end
+
+        local parsed = nil
+        pcall(function()
+            parsed = HttpService:JSONDecode(body)
+        end)
+
+        if not parsed or not parsed.data then break end
+
+        for _, s in ipairs(parsed.data) do
+            local sId = tostring(s.id)
+            local playing = tonumber(s.playing) or 0
+            local maxP = tonumber(s.maxPlayers) or 12
+
+            if sId ~= game.JobId and playing > 0 and playing <= (maxP - 1) then
+                if not visitedServers[sId] then
+                    table.insert(candidates, sId)
+                end
+            end
+        end
+
+        cursor = parsed.nextPageCursor
+        if not cursor or cursor == "null" or #candidates >= 30 then
+            break
+        end
+    end
+
+    if #candidates == 0 then
+        updateStatus("Resetting visited cache & refreshing...")
+        visitedServers = { [tostring(game.JobId)] = os.time() }
+        saveVisitedServers()
+
+        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", placeId)
+        local body = httpRequest(url)
+        if body then
+            pcall(function()
+                local parsed = HttpService:JSONDecode(body)
+                if parsed and parsed.data then
+                    for _, s in ipairs(parsed.data) do
+                        local sId = tostring(s.id)
+                        local playing = tonumber(s.playing) or 0
+                        local maxP = tonumber(s.maxPlayers) or 12
+                        if sId ~= game.JobId and playing > 0 and playing < maxP then
+                            table.insert(candidates, sId)
+                        end
+                    end
+                end
+            end)
+        end
+    end
+
+    isFetchingServers = false
+    serverCandidates = candidates
+    return #candidates > 0
+end
+
+local function queueReExecution()
+    local queueTeleport = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+    if queueTeleport then
+        pcall(function()
+            queueTeleport([[
+                task.wait(1)
+                loadstring(game:HttpGet("https://raw.githubusercontent.com/vayuhub/vayuhub/main/BloxFruits_AutoChest.lua"))()
+            ]])
+        end)
+    end
 end
 
 local function forceIntoSafeZone(reason)
@@ -1028,10 +1172,56 @@ local function forceIntoSafeZone(reason)
     return false
 end
 
+-- TeleportToPlaceInstance directly to public server instance
+-- NEVER calls Teleport(game.PlaceId) to prevent Error 773 (Restricted place)
 local function fireTeleport()
-    pcall(function()
-        TeleportService:Teleport(game.PlaceId, Player)
+    if #serverCandidates == 0 then
+        fetchServers(game.PlaceId)
+    end
+
+    if #serverCandidates == 0 then
+        warn("[Hop] No candidate servers available")
+        updateStatus("No available server found, retrying in 3s...")
+        return false
+    end
+
+    local randomIndex = math.random(1, #serverCandidates)
+    local targetJobId = table.remove(serverCandidates, randomIndex)
+    currentHopJobId = targetJobId
+
+    recordVisitedServer(targetJobId)
+    updateStatus(string.format("Teleporting to server... (%d in queue)", #serverCandidates))
+
+    queueReExecution()
+
+    local oldJobId = game.JobId
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, targetJobId, Player)
     end)
+
+    if not ok then
+        warn("[Hop] TeleportToPlaceInstance call failed:", tostring(err))
+        return false
+    end
+
+    -- Watchdog: Agar 12s tak Roblox teleport na kare, next server try karo
+    task.delay(12, function()
+        if isHopping and game.JobId == oldJobId then
+            warn("[Hop] Teleport timed out (stuck in same server), picking next...")
+            retryCount += 1
+            if retryCount <= MAX_RETRIES then
+                updateStatus(string.format("Hop timed out - retry %d/%d...", retryCount, MAX_RETRIES))
+                fireTeleport()
+            else
+                isHopping = false
+                retryCount = 0
+                clearHopMarker()
+                notify("Hop failed after timeout retries")
+            end
+        end
+    end)
+
+    return true
 end
 
 TeleportService.TeleportInitFailed:Connect(function(player, teleportResult)
@@ -1060,7 +1250,7 @@ TeleportService.TeleportInitFailed:Connect(function(player, teleportResult)
         delay = FLOOD_RETRY_DELAY
         updateStatus(string.format("Rate limited - retry %d/%d in %ds...", retryCount, MAX_RETRIES, delay))
     else
-        updateStatus(string.format("Hop failed - retry %d/%d in %ds...", retryCount, MAX_RETRIES, delay))
+        updateStatus(string.format("Hop failed (%s) - retry %d/%d in %ds...", reason, retryCount, MAX_RETRIES, delay))
     end
 
     task.delay(delay, function()
