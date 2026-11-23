@@ -9,14 +9,15 @@ local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
 
 local Player = Players.LocalPlayer
 local getgenv = getgenv or function() return _G end
 
 --================ CONFIG ================--
 local Config = {
-    TweenSpeed = 360,          -- studs/sec, thoda fast but still safe for most executors
-    TeleportSpeed = 1000,      -- manual teleport buttons ke liye fast tween speed
+    TweenSpeed = 310,          -- studs/sec, safe max for Blox Fruits anti-cheat (no rubberband)
+    TeleportSpeed = 315,      -- manual teleport buttons safe speed (no rollback)
     ChestOpenWait = 0.4,       -- wait after reaching chest
     AfterChestWait = 0.5,      -- wait before next chest
     NoChestWait = 2.5,         -- wait before server hop when no chest found
@@ -24,8 +25,8 @@ local Config = {
     LongDistance = 600,        -- isse zyada door ho toh fast travel (far chest)
     ProbeDistance = 700,       -- island anchor ke around itne studs check karega
     AnchorMergeDistance = 700, -- isse kam door wali location ko duplicate maanega
-    ProbeSpeed = 500,          -- island probe tween speed (slow = anti-cheat safe)
-    FarTravelSpeed = 800,      -- bahut door ke chest tak ki max tween speed
+    ProbeSpeed = 310,          -- island probe tween speed (safe = anti-cheat safe)
+    FarTravelSpeed = 315,      -- bahut door ke chest tak ki max tween speed (anti-cheat safe)
     ChestArriveDistance = 120, -- itne se zyada door ho toh chest claim skip (retry allowed)
     MaxChestAttempts = 2,      -- ek chest ko max itni baar try karega
     FarmButtonName = "Auto Chest Farm",
@@ -416,25 +417,34 @@ local function getNearestChest()
     return nearest
 end
 
-local noclipStates = {}
+local noclipConnection = nil
 local function setNoclip(state)
-    local char = Player.Character
-    if not char then return end
     if state then
-        noclipStates = {}
-        for _, d in ipairs(char:GetDescendants()) do
-            if d:IsA("BasePart") then
-                noclipStates[d] = d.CanCollide
-                d.CanCollide = false
-            end
+        if not noclipConnection then
+            noclipConnection = RunService.Stepped:Connect(function()
+                local char = Player.Character
+                if char then
+                    for _, d in ipairs(char:GetDescendants()) do
+                        if d:IsA("BasePart") and d.CanCollide then
+                            d.CanCollide = false
+                        end
+                    end
+                end
+            end)
         end
     else
-        for part, old in pairs(noclipStates) do
-            if part.Parent then
-                part.CanCollide = old
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
+        end
+        local char = Player.Character
+        if char then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" then
+                    d.CanCollide = true
+                end
             end
         end
-        noclipStates = {}
     end
 end
 
@@ -444,13 +454,27 @@ local function tweenTo(cf, speed, mustFinish)
     local dist = (hrp.Position - cf.Position).Magnitude
     if dist < 4 then return true end
     if dist > Config.LongDistance and not mustFinish then
-        updateStatus("Long distance chest: " .. math.floor(dist) .. " studs")
+        updateStatus("Long distance: " .. math.floor(dist) .. " studs")
     end
 
     setNoclip(true)
-    local duration = math.max(dist / (speed or Config.TweenSpeed), 0.1)
+
+    -- Blox Fruits safe speed limit (315 studs/s max to prevent 1-3s rubberband / rollback)
+    local safeSpeed = math.clamp(speed or Config.TweenSpeed, 120, 315)
+    local duration = math.max(dist / safeSpeed, 0.1)
+
     if activeTween then
         pcall(function() activeTween:Cancel() end)
+    end
+
+    -- Anti-gravity helper: holds player steady so server physics does not desync in air
+    local bv = hrp:FindFirstChild("BF_AntiFall")
+    if not bv then
+        bv = Instance.new("BodyVelocity")
+        bv.Name = "BF_AntiFall"
+        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        bv.Velocity = Vector3.zero
+        bv.Parent = hrp
     end
 
     local tween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), {
@@ -468,7 +492,19 @@ local function tweenTo(cf, speed, mustFinish)
         if conn then conn:Disconnect() end
     end)
 
+    local char = Player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
     while not finished do
+        -- Anti-cheat bypass: maintain Swimming state and zero out velocity while flying in air
+        if hrp and hrp.Parent then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+        if hum and hum.Health > 0 then
+            hum:ChangeState(Enum.HumanoidStateType.Swimming)
+        end
+
         if not mustFinish then
             if hasTargetItem() then
                 pcall(function() tween:Cancel() end)
@@ -478,12 +514,21 @@ local function tweenTo(cf, speed, mustFinish)
                 break
             end
         end
-        if not hrp.Parent then break end
+        if not hrp or not hrp.Parent then break end
         task.wait(0.05)
     end
 
     if activeTween == tween then
         activeTween = nil
+    end
+
+    local antiFall = hrp and hrp:FindFirstChild("BF_AntiFall")
+    if antiFall then
+        antiFall:Destroy()
+    end
+    if hrp and hrp.Parent then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
     end
     setNoclip(false)
     return finished and completedOk and (mustFinish or farming)
@@ -495,12 +540,9 @@ local function travelToCF(cf)
     local dist = (hrp.Position - cf.Position).Magnitude
     if dist < 4 then return true end
 
-    -- Door ke chests/islands ke liye fast tween taaki claim miss na ho.
-    -- Instant warp anti-cheat ko teleport lagta hai (position reset / restricted area),
-    -- isliye frame-by-frame movement use karo.
     if dist > Config.LongDistance then
         updateStatus("Traveling far: " .. math.floor(dist) .. " studs")
-        local speed = math.clamp(dist / 5, Config.TweenSpeed, Config.FarTravelSpeed)
+        local speed = math.clamp(Config.TweenSpeed, 200, Config.FarTravelSpeed)
         tweenTo(cf, speed, true)
         task.wait(0.15)
         return farming
@@ -519,9 +561,8 @@ local function teleportToCF(cf)
     setProbeAnchor(false)
     updateStatus("Teleporting...")
 
-    -- Pehle upar jao, phir high altitude se horizontally jao, phir neeche land karo.
-    -- Isse raaste mein paani/terrain se girna nahi hota.
-    local cruiseY = math.max(startPos.Y, destPos.Y) + 250
+    -- Smart altitude: safe height above ocean/obstacles (no excessive climb, smooth travel)
+    local cruiseY = math.clamp(math.max(startPos.Y, destPos.Y) + 80, 120, 280)
     local ok = tweenTo(CFrame.new(startPos.X, cruiseY, startPos.Z), Config.TeleportSpeed, true)
     if ok then
         ok = tweenTo(CFrame.new(destPos.X, cruiseY, destPos.Z), Config.TeleportSpeed, true)
@@ -1002,7 +1043,125 @@ local function httpGet(url)
     return game:HttpGet(url)
 end
 
+--================ SERVER HOP (FIXED FOR 773 & RESTRICTED SUB-PLACES) ================--
+local VISITED_SERVERS_FILE = "bf_visited_servers.txt"
+local visitedServers = {}
+local isHopping = false
+
+local function loadVisitedServers()
+    pcall(function()
+        if readfile and isfile and isfile(VISITED_SERVERS_FILE) then
+            for line in tostring(readfile(VISITED_SERVERS_FILE)):gmatch("[^\r\n]+") do
+                local id, ts = line:match("([^|]+)|?(%d*)")
+                if id and id ~= "" then
+                    local t = tonumber(ts) or 0
+                    -- 20 minutes ke liye cache rakho
+                    if os.time() - t < 1200 then
+                        visitedServers[id] = true
+                    end
+                end
+            end
+        end
+    end)
+    visitedServers[game.JobId] = true
+end
+
+local function recordVisitedServer(jobId)
+    visitedServers[jobId] = true
+    pcall(function()
+        if writefile then
+            local lines = {}
+            for id, _ in pairs(visitedServers) do
+                table.insert(lines, id .. "|" .. tostring(os.time()))
+            end
+            writefile(VISITED_SERVERS_FILE, table.concat(lines, "\n"))
+        end
+    end)
+end
+
+local function fetchAvailableServers()
+    loadVisitedServers()
+    local servers = {}
+    local cursor = nil
+    local guard = 0
+
+    repeat
+        guard += 1
+        -- sortOrder=Desc returns populated/active servers (avoiding 0-1 player dead/closing servers that trigger Error 773)
+        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", game.PlaceId)
+        if cursor and cursor ~= "null" then
+            url = url .. "&cursor=" .. cursor
+        end
+
+        local body = httpGet(url)
+        if not body then break end
+
+        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if not ok or not data or not data.data then break end
+
+        for _, s in ipairs(data.data) do
+            local sid = tostring(s.id)
+            local playing = tonumber(s.playing) or 0
+            local max = tonumber(s.maxPlayers) or 12
+
+            -- Anti-773 Server Filtering:
+            -- 1. Never current server
+            -- 2. At least 2 players (prevents dead / shutting down / closed instances)
+            -- 3. Room for at least 2 players (playing <= max - 2) so we never hit full server rejection
+            -- 4. Not in recent visited blacklist
+            if sid ~= game.JobId and not visitedServers[sid] then
+                if playing >= 2 and playing <= (max - 2) then
+                    table.insert(servers, sid)
+                end
+            end
+            if #servers >= 25 then break end
+        end
+
+        cursor = data.nextPageCursor
+    until not cursor or cursor == "null" or #servers >= 25 or guard >= 4
+
+    -- Relaxed fallback: if strict filter didn't find enough, allow (playing < max)
+    if #servers == 0 then
+        cursor = nil
+        guard = 0
+        repeat
+            guard += 1
+            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", game.PlaceId)
+            if cursor and cursor ~= "null" then
+                url = url .. "&cursor=" .. cursor
+            end
+            local body = httpGet(url)
+            if not body then break end
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if not ok or not data or not data.data then break end
+
+            for _, s in ipairs(data.data) do
+                local sid = tostring(s.id)
+                local playing = tonumber(s.playing) or 0
+                local max = tonumber(s.maxPlayers) or 12
+                if sid ~= game.JobId and not visitedServers[sid] then
+                    if playing >= 2 and playing < max then
+                        table.insert(servers, sid)
+                    end
+                end
+                if #servers >= 15 then break end
+            end
+            cursor = data.nextPageCursor
+        until not cursor or cursor == "null" or #servers >= 15 or guard >= 3
+    end
+
+    -- If all servers are blacklisted, reset visited list except current server
+    if #servers == 0 then
+        visitedServers = { [game.JobId] = true }
+    end
+
+    return servers
+end
+
 function serverHop(anyServer)
+    if isHopping then return end
+    isHopping = true
+
     local wasFarming = farming
     farming = false
     if activeTween then
@@ -1016,7 +1175,7 @@ function serverHop(anyServer)
         farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
     end
     if anyServer then
-        updateStatus("Auto hop: random server...")
+        updateStatus("Auto hop: finding valid server...")
     else
         updateStatus("Hopping for " .. Config.MinServerHours .. "h+ server...")
     end
@@ -1029,64 +1188,59 @@ function serverHop(anyServer)
         task.wait(0.8)
     end
 
-    -- Auto-hop mode: kisi bhi random server pe jao (server list ki zaroorat nahi)
-    if anyServer then
-        writeHopMarker(wasFarming, "a")
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, Player)
-        end)
-        return
-    end
+    writeHopMarker(wasFarming, anyServer and "a" or "")
 
-    local servers = {}
-    pcall(function()
-        local cursor = nil
-        local guard = 0
-        repeat
-            guard += 1
-            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
-            if cursor and cursor ~= "null" then
-                url = url .. "&cursor=" .. cursor
-            end
-            local body = httpGet(url)
-            if not body then break end
-            local data = HttpService:JSONDecode(body)
-            for _, s in ipairs(data.data or {}) do
-                if s.id ~= game.JobId and s.playing < s.maxPlayers then
-                    table.insert(servers, tostring(s.id))
-                end
-                if #servers >= 25 then break end
-            end
-            cursor = data.nextPageCursor
-        until not cursor or cursor == "null" or #servers >= 25 or guard >= 3
-    end)
-
-    -- Naye server pe pahunche toh uptime check hoga; farm chal raha tha toh wapas start hoga
-    writeHopMarker(wasFarming)
-
+    local servers = fetchAvailableServers()
     if #servers > 0 then
         local chosen = servers[math.random(1, #servers)]
-        local oldJob = game.JobId
+        recordVisitedServer(chosen)
+        updateStatus("Teleporting to server " .. chosen:sub(1, 8) .. "...")
+
+        -- Queue script for auto execution upon joining
+        pcall(function()
+            local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+            if qot then
+                qot([[loadstring(game:HttpGet("https://raw.githubusercontent.com/vayuhub/vayuhub/main/BloxFruits_AutoChest.lua"))()]])
+            end
+        end)
+
+        -- ALWAYS use TeleportToPlaceInstance with valid JobId (NEVER Teleport(game.PlaceId))
         pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen, Player)
         end)
-        -- TeleportToPlaceInstance async fail ho sakta hai (error 773 - restricted).
-        -- pcall ise catch nahi karta, isliye thode der baad check karo:
-        -- agar wahi server pe ho toh random server pe chalo.
-        task.delay(6, function()
+
+        -- In case TeleportToPlaceInstance gets stuck/fails silently, retry after timeout
+        local oldJob = game.JobId
+        task.delay(7, function()
             if game.JobId == oldJob and getHRP() then
-                updateStatus("JobId teleport failed - random server hop...")
-                pcall(function()
-                    TeleportService:Teleport(game.PlaceId, Player)
-                end)
+                isHopping = false
+                updateStatus("Hop timed out - trying another server...")
+                task.wait(1)
+                serverHop(anyServer)
             end
         end)
     else
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, Player)
+        isHopping = false
+        updateStatus("Searching servers again in 4s...")
+        task.delay(4, function()
+            serverHop(anyServer)
         end)
     end
 end
+
+-- TeleportInitFailed hook (handles any rejected teleport and immediately switches server)
+pcall(function()
+    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+        if player == Player then
+            isHopping = false
+            warn("[ServerHop] Teleport failed (" .. tostring(teleportResult) .. "): " .. tostring(errorMessage))
+            updateStatus("Hop failed (" .. tostring(teleportResult) .. ") - retrying...")
+            task.delay(1.5, function()
+                serverHop(true)
+            end)
+        end
+    end)
+end)
 
 --================ AUTO SERVER HOP (har 60s, koi bhi server) ================--
 local AUTO_HOP_FILE = "bf_auto_hop.txt"
@@ -1143,21 +1297,8 @@ local function autoHopLoop()
                     count += 1
                     lastHop = os.time()
                     saveAutoHopState(count, lastHop)
-                    updateStatus("Auto hop " .. count .. "/" .. Config.MaxAutoHops .. " - random server")
+                    updateStatus("Auto hop " .. count .. "/" .. Config.MaxAutoHops .. "...")
                     serverHop(true)
-                    -- Teleport fail ho (same JobId) toh har 4s mein retry
-                    local oldJob = game.JobId
-                    for _ = 1, 4 do
-                        task.wait(Config.HopRetryDelay)
-                        if game.JobId ~= oldJob then break end
-                        if count < Config.MaxAutoHops then
-                            count += 1
-                            lastHop = os.time()
-                            saveAutoHopState(count, lastHop)
-                        end
-                        serverHop(true)
-                        oldJob = game.JobId
-                    end
                 end
             end
         end
