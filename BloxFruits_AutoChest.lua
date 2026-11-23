@@ -1050,47 +1050,7 @@ local function startChestFarm()
     task.spawn(chestFarmLoop)
 end
 
---================ SERVER HOP ================--
-local function httpGet(url)
-    local headers = {
-        ["Accept"] = "application/json",
-        ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    local req = (syn and syn.request)
-        or (http and http.request)
-        or http_request
-        or request
-        or (fluxus and fluxus.request)
-        or (krnl and krnl.request)
-
-    if req then
-        local ok, res = pcall(function()
-            return req({
-                Url = url,
-                Method = "GET",
-                Headers = headers
-            })
-        end)
-        if ok and type(res) == "table" then
-            local body = res.Body or res.body or res.Response or res.response
-            if body and #tostring(body) > 0 then
-                return tostring(body)
-            end
-        end
-    end
-
-    local ok2, body2 = pcall(function()
-        return game:HttpGet(url)
-    end)
-    if ok2 and body2 and #tostring(body2) > 0 then
-        return tostring(body2)
-    end
-
-    return nil
-end
-
---================ SERVER HOP (ROBUST FOR ALL EXECUTORS) ================--
+--================ SERVER HOP (FAST & RELIABLE) ================--
 local VISITED_SERVERS_FILE = "bf_visited_servers.txt"
 local visitedServers = {}
 
@@ -1124,100 +1084,103 @@ local function recordVisitedServer(jobId)
     end)
 end
 
-local function fetchRobloxServers(placeId, sortOrder, cursor)
-    local query = "sortOrder=" .. (sortOrder or "Asc") .. "&limit=100"
-    if cursor and cursor ~= "" and cursor ~= "null" then
-        query = query .. "&cursor=" .. tostring(cursor)
+-- Fast raw fetch: direct game:HttpGet first, RoProxy fallback, request fallback
+local function fetchServerJson(placeId, sortOrder)
+    local order = sortOrder or "Desc"
+    local raw = nil
+
+    -- 1. Direct game:HttpGet (fastest, standard in 99% of executors)
+    local url1 = "https://games.roblox.com/v1/games/" .. tostring(placeId) .. "/servers/Public?sortOrder=" .. order .. "&limit=100"
+    local ok1, res1 = pcall(function()
+        return game:HttpGet(url1)
+    end)
+    if ok1 and res1 and #tostring(res1) > 30 then
+        raw = res1
     end
 
-    -- Primary: official Roblox API
-    local url1 = "https://games.roblox.com/v1/games/" .. tostring(placeId) .. "/servers/Public?" .. query
-    local body = httpGet(url1)
-
-    -- Fallback: RoProxy (reliable mirror for executors when roblox.com is blocked)
-    if not body then
-        local url2 = "https://games.roproxy.com/v1/games/" .. tostring(placeId) .. "/servers/Public?" .. query
-        body = httpGet(url2)
-    end
-
-    if body then
-        local ok, decoded = pcall(function()
-            return HttpService:JSONDecode(body)
+    -- 2. RoProxy fallback if games.roblox.com is blocked
+    if not raw then
+        local url2 = "https://games.roproxy.com/v1/games/" .. tostring(placeId) .. "/servers/Public?sortOrder=" .. order .. "&limit=100"
+        local ok2, res2 = pcall(function()
+            return game:HttpGet(url2)
         end)
-        if ok and type(decoded) == "table" and type(decoded.data) == "table" then
-            return decoded
+        if ok2 and res2 and #tostring(res2) > 30 then
+            raw = res2
         end
     end
 
+    -- 3. Executor request() fallback
+    if not raw then
+        local req = (syn and syn.request) or request or http_request or (http and http.request)
+        if req then
+            local ok3, res3 = pcall(function()
+                return req({ Url = "https://games.roblox.com/v1/games/" .. tostring(placeId) .. "/servers/Public?sortOrder=" .. order .. "&limit=100", Method = "GET" })
+            end)
+            if ok3 and res3 then
+                local b = res3.Body or res3.body
+                if b and #tostring(b) > 30 then
+                    raw = b
+                end
+            end
+        end
+    end
+
+    if raw then
+        local ok, decoded = pcall(function()
+            return HttpService:JSONDecode(raw)
+        end)
+        if ok and type(decoded) == "table" and type(decoded.data) == "table" then
+            return decoded.data
+        end
+    end
     return nil
 end
 
 local function fetchAvailableServers()
     loadVisitedServers()
     local servers = {}
-    local targetPlaceId = getTargetPlaceId() -- Official canonical Sea Place ID (prevents Unauthorized / sub-place mismatch)
+    local placeId = game.PlaceId
 
-    local function collectServers(data, minPlayers, maxPlayers)
-        if not data or not data.data then return end
-        for _, s in ipairs(data.data) do
+    local function parseList(serverList)
+        if not serverList then return end
+        for _, s in ipairs(serverList) do
             local sid = tostring(s.id)
             local playing = tonumber(s.playing) or 0
             local max = tonumber(s.maxPlayers) or 12
 
-            -- Strict Anti-Unauthorized Rules:
-            -- 1. Not current server (game.JobId)
-            -- 2. Not already visited in last 20 minutes
-            -- 3. Has at least minPlayers (NOT dying/closing instances which trigger Unauthorized)
-            -- 4. Not full (playing <= maxPlayers)
+            -- Active public servers with open slots:
+            -- Not current server, not visited in last 20m, at least 3 players (not dying/closing), and has room
             if sid ~= game.JobId and not visitedServers[sid] then
-                if playing >= minPlayers and playing <= maxPlayers then
+                if playing >= 3 and playing < max then
                     table.insert(servers, sid)
                 end
             end
-            if #servers >= 35 then break end
         end
     end
 
-    -- Pass 1: Scan Descending order across pages 1 to 6 (Find active, healthy servers with 5 to 10 players)
-    local cursor = nil
-    local guard = 0
-    repeat
-        guard += 1
-        local data = fetchRobloxServers(targetPlaceId, "Desc", cursor)
-        if data then
-            collectServers(data, 5, 10)
-            cursor = data.nextPageCursor
-        else
-            break
-        end
-    until not cursor or cursor == "null" or #servers >= 25 or guard >= 6
+    -- Try Descending first (active, full lobbies with open slots)
+    local dataDesc = fetchServerJson(placeId, "Desc")
+    parseList(dataDesc)
 
-    -- Pass 2: If Descending didn't yield enough, scan Ascending starting from 5 players
-    if #servers < 10 then
-        cursor = nil
-        guard = 0
-        repeat
-            guard += 1
-            local data = fetchRobloxServers(targetPlaceId, "Asc", cursor)
-            if data then
-                collectServers(data, 5, 10)
-                cursor = data.nextPageCursor
-            else
-                break
-            end
-        until not cursor or cursor == "null" or #servers >= 25 or guard >= 5
+    -- If not enough, try Ascending (lower player count)
+    if #servers < 5 then
+        local dataAsc = fetchServerJson(placeId, "Asc")
+        parseList(dataAsc)
     end
 
-    -- Pass 3: Relaxed range (4 to 11 players) - avoids 1-3 player dead/shutting down servers
+    -- If canonical place ID is different, try canonical place ID
     if #servers == 0 then
-        local data = fetchRobloxServers(targetPlaceId, "Desc", nil)
-            or fetchRobloxServers(targetPlaceId, "Asc", nil)
-        if data then
-            collectServers(data, 4, 11)
+        local canonicalId = getTargetPlaceId()
+        if canonicalId and canonicalId ~= placeId then
+            local dataCan = fetchServerJson(canonicalId, "Desc") or fetchServerJson(canonicalId, "Asc")
+            if dataCan then
+                placeId = canonicalId
+                parseList(dataCan)
+            end
         end
     end
 
-    -- Pass 4: Reset visited list if all known servers were visited
+    -- If all known servers were visited in last 20m, reset cache (keep current server) and retry
     if #servers == 0 then
         visitedServers = { [game.JobId] = true }
         pcall(function()
@@ -1225,21 +1188,10 @@ local function fetchAvailableServers()
                 writefile(VISITED_SERVERS_FILE, game.JobId .. "|" .. tostring(os.time()))
             end
         end)
-        local data = fetchRobloxServers(targetPlaceId, "Desc", nil)
-            or fetchRobloxServers(targetPlaceId, "Asc", nil)
-        if data and data.data then
-            for _, s in ipairs(data.data) do
-                local sid = tostring(s.id)
-                local playing = tonumber(s.playing) or 0
-                local max = tonumber(s.maxPlayers) or 12
-                if sid ~= game.JobId and playing >= 4 and playing <= (max - 1) then
-                    table.insert(servers, sid)
-                end
-            end
-        end
+        parseList(dataDesc)
     end
 
-    return servers, targetPlaceId
+    return servers, placeId
 end
 
 local MAX_HOP_TRIES = 10
@@ -1291,20 +1243,9 @@ function executeHopAttempt()
     end
 
     hopAttempts += 1
-    updateStatus("Hop attempt " .. hopAttempts .. "/" .. MAX_HOP_TRIES .. "...")
-
-    -- Safe zone warp before teleport to prevent combat log or void desync
-    local hopZone = nearestSafeZoneCF()
-    if hopZone then
-        updateStatus("Safe zone before hop...")
-        warpTo(hopZone.CFrame + Vector3.new(0, 8, 0))
-        task.wait(0.5)
-    end
+    updateStatus("Hopping... (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")")
 
     writeHopMarker(farming, "a")
-
-    local servers, targetPlaceId = fetchAvailableServers()
-    targetPlaceId = targetPlaceId or getTargetPlaceId()
 
     -- Queue script for auto execution upon joining new server
     pcall(function()
@@ -1322,49 +1263,34 @@ function executeHopAttempt()
         end
     end)
 
+    local servers, targetPlaceId = fetchAvailableServers()
+    targetPlaceId = targetPlaceId or game.PlaceId
+
     if #servers > 0 then
         local chosen = servers[math.random(1, #servers)]
         recordVisitedServer(chosen)
-        updateStatus("Joining server " .. chosen:sub(1, 8) .. " (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
+        updateStatus("Joining " .. chosen:sub(1, 8) .. " (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
 
-        local teleportStarted = false
-
-        -- Method 1: Modern TeleportAsync with TeleportOptions (official API, avoids Unauthorized error)
         local ok, err = pcall(function()
-            local opt = Instance.new("TeleportOptions")
-            opt.ServerInstanceId = chosen
-            TeleportService:TeleportAsync(targetPlaceId, { Player }, opt)
+            TeleportService:TeleportToPlaceInstance(targetPlaceId, chosen, Player)
         end)
 
-        if ok then
-            teleportStarted = true
-        else
-            warn("[ServerHop] TeleportAsync failed: " .. tostring(err) .. " - trying TeleportToPlaceInstance")
-            -- Method 2: Fallback to TeleportToPlaceInstance
-            local ok2, err2 = pcall(function()
-                TeleportService:TeleportToPlaceInstance(targetPlaceId, chosen, Player)
-            end)
-            if ok2 then
-                teleportStarted = true
-            else
-                warn("[ServerHop] TeleportToPlaceInstance failed: " .. tostring(err2))
-            end
-        end
-
-        if not teleportStarted then
+        if not ok then
+            warn("[ServerHop] TeleportToPlaceInstance error: " .. tostring(err))
             scheduleHopRetry(Config.HopRetryDelay, "Teleport call failed")
             return
         end
 
-        -- Watchdog timeout: agar 8s mein teleport nahi hua toh retry karo
+        -- Watchdog timeout: agar 8s mein teleport nahi hua toh agla server try karo
         local oldJob = game.JobId
         task.delay(8, function()
             if game.JobId == oldJob and getHRP() and isHoppingActive then
-                scheduleHopRetry(Config.HopRetryDelay, "Hop timed out")
+                scheduleHopRetry(Config.HopRetryDelay, "Server full/timeout")
             end
         end)
     else
-        scheduleHopRetry(Config.HopRetryDelay, "Finding servers...")
+        updateStatus("No servers found - retrying...")
+        scheduleHopRetry(Config.HopRetryDelay, "No open servers found")
     end
 end
 
