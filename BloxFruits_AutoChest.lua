@@ -8,8 +8,13 @@ local TweenService = game:GetService("TweenService")
 local TeleportService = game:GetService("TeleportService")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 
 local Player = Players.LocalPlayer
+while not Player do
+    Player = Players.LocalPlayer
+    task.wait(0.1)
+end
 local getgenv = getgenv or function() return _G end
 
 --================ CONFIG ================--
@@ -1552,15 +1557,39 @@ end
 
 --================ GUI ================--
 local function buildGUI()
-    local playerGui = Player:FindFirstChild("PlayerGui") or Player:WaitForChild("PlayerGui")
-    local old = playerGui:FindFirstChild("BloxFruitModMenu")
-    if old then old:Destroy() end
+    local guiParent = nil
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then guiParent = h end
+    end
+    if not guiParent then
+        pcall(function()
+            if CoreGui and CoreGui:FindFirstChild("RobloxGui") then
+                guiParent = CoreGui
+            end
+        end)
+    end
+    if not guiParent then
+        local p = Players.LocalPlayer or Player
+        if p then
+            guiParent = p:FindFirstChild("PlayerGui") or p:WaitForChild("PlayerGui", 5)
+        end
+    end
+    if not guiParent then
+        guiParent = CoreGui
+    end
+
+    local old = guiParent and guiParent:FindFirstChild("BloxFruitModMenu")
+    if old then pcall(function() old:Destroy() end) end
 
     local gui = Instance.new("ScreenGui")
     gui.Name = "BloxFruitModMenu"
     gui.ResetOnSpawn = false
     gui.DisplayOrder = 999
-    gui.Parent = playerGui
+    pcall(function()
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    end)
+    gui.Parent = guiParent
 
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 280, 0, 384)
@@ -1713,8 +1742,18 @@ UserInputService.InputChanged:Connect(function(input)
 end)
 
 --================ BOOT ================--
-buildGUI()
-task.spawn(autoHopLoop)
-checkServerHopMarker()
+local ok, err = pcall(buildGUI)
+if not ok then
+    warn("[Blox Fruits Mod Menu] buildGUI failed: " .. tostring(err))
+end
+
+pcall(function()
+    task.spawn(autoHopLoop)
+end)
+
+pcall(function()
+    checkServerHopMarker()
+end)
+
 updateStatus("Script loaded - press Auto Chest Farm")
 notify("Blox Fruits mod menu loaded")
