@@ -51,6 +51,11 @@ local SeaByPlace = {
     [79091703265657] = 2,
     [100117331123089] = 3,
 }
+local CanonicalPlaceIDs = {
+    [1] = 2753915549,  -- Sea 1 (First Sea / Main)
+    [2] = 4442272183,  -- Sea 2 (Second Sea / Dressrosa)
+    [3] = 7449423635,  -- Sea 3 (Third Sea / Zou)
+}
 local TravelRemote = {
     [1] = "TravelMain",
     [2] = "TravelDressrosa",
@@ -159,7 +164,30 @@ local function getHRP()
 end
 
 local function currentSea()
-    return SeaByPlace[game.PlaceId]
+    if SeaByPlace[game.PlaceId] then
+        return SeaByPlace[game.PlaceId]
+    end
+    -- Fallback via workspace objects/locations
+    local origin = Workspace:FindFirstChild("_WorldOrigin")
+    local locations = origin and origin:FindFirstChild("Locations")
+    if locations then
+        if locations:FindFirstChild("The Cafe") or locations:FindFirstChild("Green Zone") or locations:FindFirstChild("Dark Area") or locations:FindFirstChild("Factory") then
+            return 2
+        elseif locations:FindFirstChild("Castle on the Sea") or locations:FindFirstChild("Floating Turtle") or locations:FindFirstChild("Hydra Island") or locations:FindFirstChild("Port Town") then
+            return 3
+        elseif locations:FindFirstChild("Jungle") or locations:FindFirstChild("WindMill") or locations:FindFirstChild("Middle Town") then
+            return 1
+        end
+    end
+    return 1
+end
+
+local function getTargetPlaceId()
+    local s = currentSea()
+    if s and CanonicalPlaceIDs[s] then
+        return CanonicalPlaceIDs[s]
+    end
+    return game.PlaceId
 end
 
 local function updateStatus(text)
@@ -1070,51 +1098,48 @@ end
 local function fetchAvailableServers()
     loadVisitedServers()
     local servers = {}
-    local placeIdStr = tostring(game.PlaceId) -- tostring used to avoid 32-bit integer overflow on large Place IDs
+    local targetPlaceId = getTargetPlaceId()
+    local placeIdStr = tostring(targetPlaceId)
 
-    -- Try Ascending first (avoids full servers, checks for healthy servers with open slots)
-    local sortModes = { "Asc", "Desc" }
-    for _, sortMode in ipairs(sortModes) do
-        local cursor = nil
-        local guard = 0
-        repeat
-            guard += 1
-            local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=" .. sortMode .. "&limit=100"
-            if cursor and cursor ~= "null" and cursor ~= "" then
-                url = url .. "&cursor=" .. tostring(cursor)
-            end
+    -- ANTI-773: Use Descending only! (Ascending servers with 1-2 players are dead/shutting down instances)
+    -- We want active, healthy servers with 5 to 10 players so they are NOT closing down and have open slots.
+    local cursor = nil
+    local guard = 0
+    repeat
+        guard += 1
+        local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=Desc&limit=100"
+        if cursor and cursor ~= "null" and cursor ~= "" then
+            url = url .. "&cursor=" .. tostring(cursor)
+        end
 
-            local body = httpGet(url)
-            if not body then break end
+        local body = httpGet(url)
+        if not body then break end
 
-            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-            if not ok or not data or not data.data then break end
+        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if not ok or not data or not data.data then break end
 
-            for _, s in ipairs(data.data) do
-                local sid = tostring(s.id)
-                local playing = tonumber(s.playing) or 0
-                local max = tonumber(s.maxPlayers) or 12
+        for _, s in ipairs(data.data) do
+            local sid = tostring(s.id)
+            local playing = tonumber(s.playing) or 0
+            local max = tonumber(s.maxPlayers) or 12
 
-                -- ANTI-773 RULES:
-                -- 1. Never current server
-                -- 2. At least 3 players (1-2 player servers are often shutting down or restricted instances)
-                -- 3. Room for at least 2 players (playing <= max - 2) so server is not full
-                -- 4. Not in recently failed/visited blacklist
-                if sid ~= game.JobId and not visitedServers[sid] then
-                    if playing >= 3 and playing <= (max - 2) then
-                        table.insert(servers, sid)
-                    end
+            -- Strict Anti-773 rules:
+            -- 1. Not current server
+            -- 2. Not already visited in last 20m
+            -- 3. At least 5 players (prevents dying/shutting down servers that trigger 773)
+            -- 4. Room for at least 2 players so server is not full
+            if sid ~= game.JobId and not visitedServers[sid] then
+                if playing >= 5 and playing <= (max - 2) then
+                    table.insert(servers, sid)
                 end
-                if #servers >= 30 then break end
             end
+            if #servers >= 30 then break end
+        end
 
-            cursor = data.nextPageCursor
-        until not cursor or cursor == "null" or #servers >= 30 or guard >= 3
+        cursor = data.nextPageCursor
+    until not cursor or cursor == "null" or #servers >= 30 or guard >= 4
 
-        if #servers >= 5 then break end
-    end
-
-    -- Fallback: Relaxed filter if no server matched strict conditions
+    -- Relaxed fallback if strictly filtered servers were not found (playing 4 to max-1)
     if #servers == 0 then
         local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=Desc&limit=100"
         local body = httpGet(url)
@@ -1126,7 +1151,7 @@ local function fetchAvailableServers()
                     local playing = tonumber(s.playing) or 0
                     local max = tonumber(s.maxPlayers) or 12
                     if sid ~= game.JobId and not visitedServers[sid] then
-                        if playing >= 2 and playing < max then
+                        if playing >= 4 and playing < max then
                             table.insert(servers, sid)
                         end
                     end
@@ -1140,15 +1165,43 @@ local function fetchAvailableServers()
         visitedServers = { [game.JobId] = true }
     end
 
-    return servers
+    return servers, targetPlaceId
 end
 
 local MAX_HOP_TRIES = 10
 local hopAttempts = 0
 local isHoppingActive = false
+local isAttemptPending = false
 local autoHopDone = false
 
-local function executeHopAttempt()
+local function scheduleHopRetry(delaySeconds, reason)
+    if not isHoppingActive then return end
+    if isAttemptPending then return end
+    isAttemptPending = true
+
+    if hopAttempts >= MAX_HOP_TRIES then
+        isHoppingActive = false
+        isAttemptPending = false
+        hopAttempts = 0
+        updateStatus("Hop failed after 10 tries - staying in server")
+        notify("Server hop failed 10 times - stopped")
+        if autoHopButton then
+            autoHopButton.Text = "6. Auto Hop: Failed (10x)"
+            autoHopButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+        end
+        return
+    end
+
+    updateStatus((reason or "Retrying hop") .. " in " .. tostring(delaySeconds) .. "s (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
+    task.delay(delaySeconds, function()
+        isAttemptPending = false
+        if isHoppingActive then
+            executeHopAttempt()
+        end
+    end)
+end
+
+function executeHopAttempt()
     if not isHoppingActive then return end
 
     if hopAttempts >= MAX_HOP_TRIES then
@@ -1176,41 +1229,78 @@ local function executeHopAttempt()
 
     writeHopMarker(farming, "a")
 
-    local servers = fetchAvailableServers()
-    if #servers > 0 then
+    local servers, targetPlaceId = fetchAvailableServers()
+    targetPlaceId = targetPlaceId or getTargetPlaceId()
+
+    -- Queue script for auto execution upon joining new server
+    pcall(function()
+        local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+        if qot then
+            qot([[
+                pcall(function()
+                    if readfile and isfile and isfile("BloxFruits_AutoChest.lua") then
+                        loadstring(readfile("BloxFruits_AutoChest.lua"))()
+                    else
+                        loadstring(game:HttpGet("https://raw.githubusercontent.com/vayuhub/vayuhub/main/BloxFruits_AutoChest.lua"))()
+                    end
+                end)
+            ]])
+        end
+    end)
+
+    if #servers > 0 and hopAttempts < 8 then
         local chosen = servers[math.random(1, #servers)]
         recordVisitedServer(chosen)
         updateStatus("Joining server " .. chosen:sub(1, 8) .. " (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
 
-        -- Queue script for auto execution upon joining
-        pcall(function()
-            local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-            if qot then
-                qot([[loadstring(game:HttpGet("https://raw.githubusercontent.com/vayuhub/vayuhub/main/BloxFruits_AutoChest.lua"))()]])
+        -- Method 1: Modern TeleportAsync with TeleportOptions (prevents Error 773 sub-place mismatch)
+        local teleportStarted = false
+        local ok, err = pcall(function()
+            local opt = Instance.new("TeleportOptions")
+            opt.ServerInstanceId = chosen
+            TeleportService:TeleportAsync(targetPlaceId, { Player }, opt)
+        end)
+
+        if ok then
+            teleportStarted = true
+        else
+            warn("[ServerHop] TeleportAsync error: " .. tostring(err) .. " - trying TeleportToPlaceInstance")
+            -- Method 2: Fallback to TeleportToPlaceInstance
+            local ok2, err2 = pcall(function()
+                TeleportService:TeleportToPlaceInstance(targetPlaceId, chosen, Player)
+            end)
+            if ok2 then
+                teleportStarted = true
+            else
+                warn("[ServerHop] TeleportToPlaceInstance error: " .. tostring(err2))
             end
-        end)
+        end
 
-        pcall(function()
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen, Player)
-        end)
+        if not teleportStarted then
+            scheduleHopRetry(Config.HopRetryDelay, "Teleport call failed")
+            return
+        end
 
-        -- Timeout: agar 6s mein teleport nahi hua toh 5s delay ke baad retry karo
+        -- Watchdog timeout: agar 6.5s mein teleport nahi hua toh retry karo
         local oldJob = game.JobId
-        task.delay(6, function()
+        task.delay(6.5, function()
             if game.JobId == oldJob and getHRP() and isHoppingActive then
-                updateStatus("Hop attempt " .. hopAttempts .. " timed out - retrying in " .. Config.HopRetryDelay .. "s...")
-                task.wait(Config.HopRetryDelay)
-                if isHoppingActive and game.JobId == oldJob then
-                    executeHopAttempt()
-                end
+                scheduleHopRetry(Config.HopRetryDelay, "Hop timed out")
             end
         end)
     else
-        updateStatus("No servers found - retrying (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ") in " .. Config.HopRetryDelay .. "s...")
-        task.wait(Config.HopRetryDelay)
-        if isHoppingActive then
-            executeHopAttempt()
-        end
+        -- Method 3 Fallback: Standard Teleport matchmaking (CANNOT trigger Error 773)
+        -- Used when server list is exhausted or after 7 direct attempts failed
+        updateStatus("Matchmaker hop (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
+        pcall(function()
+            TeleportService:Teleport(targetPlaceId, Player)
+        end)
+        local oldJob = game.JobId
+        task.delay(7, function()
+            if game.JobId == oldJob and getHRP() and isHoppingActive then
+                scheduleHopRetry(Config.HopRetryDelay, "Matchmaker hop timed out")
+            end
+        end)
     end
 end
 
@@ -1234,54 +1324,70 @@ function serverHop()
     executeHopAttempt()
 end
 
--- TeleportInitFailed hook (handles any rejected teleport and retries up to 10 times)
+-- TeleportInitFailed hook (handles any rejected teleport and retries via scheduleHopRetry)
 pcall(function()
     TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
         if player == Player and isHoppingActive then
-            warn("[ServerHop] Teleport failed (" .. tostring(teleportResult) .. "): " .. tostring(errorMessage))
-            updateStatus("Hop rejected - retrying in " .. Config.HopRetryDelay .. "s (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
-            task.delay(Config.HopRetryDelay, function()
-                if isHoppingActive then
-                    executeHopAttempt()
-                end
-            end)
+            warn("[ServerHop] TeleportInitFailed (" .. tostring(teleportResult) .. "): " .. tostring(errorMessage))
+            scheduleHopRetry(Config.HopRetryDelay, "Hop rejected (" .. tostring(teleportResult) .. ")")
         end
     end)
 end)
 
 -- Anti-773 CoreGui ErrorPrompt Auto-Dismiss & Recovery
+local function handlePromptOverlay(overlay)
+    if not overlay then return end
+
+    local function dismissPrompt(prompt)
+        if not prompt or not isHoppingActive then return end
+        if prompt.Name == "ErrorPrompt" then
+            task.wait(0.2)
+            -- Clear Roblox error state so client does not disconnect
+            pcall(function()
+                game:GetService("GuiService"):ClearError()
+            end)
+            pcall(function()
+                prompt.Visible = false
+                prompt:Destroy()
+            end)
+            updateStatus("Error 773 dismissed - retrying server...")
+            scheduleHopRetry(Config.HopRetryDelay, "Error 773 cleared")
+        end
+    end
+
+    -- Hook newly added prompts
+    overlay.ChildAdded:Connect(function(child)
+        dismissPrompt(child)
+    end)
+
+    -- Check if ErrorPrompt is already on screen right now
+    for _, child in ipairs(overlay:GetChildren()) do
+        if child.Name == "ErrorPrompt" then
+            dismissPrompt(child)
+        end
+    end
+end
+
 pcall(function()
     local rpg = CoreGui:FindFirstChild("RobloxPromptGui")
-    local promptOverlay = rpg and rpg:FindFirstChild("promptOverlay")
-    if not promptOverlay then
+    if rpg then
+        local overlay = rpg:FindFirstChild("promptOverlay")
+        if overlay then
+            handlePromptOverlay(overlay)
+        else
+            rpg.ChildAdded:Connect(function(child)
+                if child.Name == "promptOverlay" then
+                    handlePromptOverlay(child)
+                end
+            end)
+        end
+    else
         task.spawn(function()
             local gui = CoreGui:WaitForChild("RobloxPromptGui", 10)
             if gui then
                 local overlay = gui:WaitForChild("promptOverlay", 10)
                 if overlay then
-                    overlay.ChildAdded:Connect(function(child)
-                        if child.Name == "ErrorPrompt" and isHoppingActive then
-                            task.wait(0.3)
-                            updateStatus("Error 773 dismissed - retrying in " .. Config.HopRetryDelay .. "s...")
-                            local btn = child:FindFirstChild("Button", true) or child:FindFirstChild("ConfirmButton", true)
-                            if btn then
-                                pcall(function()
-                                    local vim = game:GetService("VirtualInputManager")
-                                    if vim then
-                                        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
-                                        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
-                                        task.wait(0.05)
-                                        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
-                                    end
-                                end)
-                            end
-                            task.delay(Config.HopRetryDelay, function()
-                                if isHoppingActive then
-                                    executeHopAttempt()
-                                end
-                            end)
-                        end
-                    end)
+                    handlePromptOverlay(overlay)
                 end
             end
         end)
