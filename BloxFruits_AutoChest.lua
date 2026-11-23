@@ -30,7 +30,7 @@ local Config = {
     ChestArriveDistance = 120, -- itne se zyada door ho toh chest claim skip (retry allowed)
     MaxChestAttempts = 2,      -- ek chest ko max itni baar try karega
     FarmButtonName = "Auto Chest Farm",
-    AutoHopDelay = 70,         -- 70 seconds baad 1 baar server hop karega
+    AutoHopDelay = 90,         -- 90 seconds baad 1 baar server hop karega
     MaxHopAttempts = 10,       -- hop fail hone par max 10 tries karega
     HopRetryDelay = 5,         -- teleport fail hone par 5 seconds baad retry karega
 }
@@ -754,7 +754,7 @@ local function chestFarmLoop()
             end
         else
             if islandTourDone then
-                updateStatus("Chests tour done - waiting respawn / 70s hop...")
+                updateStatus("Chests tour done - waiting respawn / 90s hop...")
                 visitedChests = {}
                 islandTourDone = false
                 task.wait(3)
@@ -767,7 +767,7 @@ local function chestFarmLoop()
                 setProbeAnchor(true)
                 task.wait(Config.IslandCheckWait)
             else
-                updateStatus("Waiting for 70s hop timer...")
+                updateStatus("Waiting for 90s hop timer...")
                 task.wait(3)
             end
         end
@@ -867,8 +867,8 @@ local function teleportSafeZone()
     end
 end
 
---================ 4H+ SERVER HOP ================--
-local HOP_MARKER_FILE = "bf_4h_server_hop.txt"
+--================ SERVER HOP CONFIG & HELPERS ================--
+local HOP_MARKER_FILE = "bf_hop_marker.txt"
 local HOP_MARKER_MAX_AGE = 900 -- marker 15 min se purana ho toh ignore (stale hop na chale)
 
 local function getServerUptimeSeconds()
@@ -1012,11 +1012,11 @@ end
 
 local pendingHopCount = 0
 
--- Marker format: timestamp|farmFlag|hopCount|mode ("a" = any-server auto hop, no age check)
+-- Marker format: timestamp|farmFlag|hopCount|mode ("a" = auto hop, koi bhi public server)
 local function writeHopMarker(farmFlag, mode)
     pcall(function()
         if writefile then
-            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0") .. "|" .. tostring(pendingHopCount) .. "|" .. (mode or ""))
+            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0") .. "|" .. tostring(pendingHopCount) .. "|" .. (mode or "a"))
         end
     end)
     pendingHopCount = 0
@@ -1028,6 +1028,9 @@ local function clearHopMarker()
             delfile(HOP_MARKER_FILE)
         elseif writefile then
             writefile(HOP_MARKER_FILE, "")
+        end
+        if delfile and isfile and isfile("bf_4h_server_hop.txt") then
+            delfile("bf_4h_server_hop.txt")
         end
     end)
 end
@@ -1049,20 +1052,47 @@ end
 
 --================ SERVER HOP ================--
 local function httpGet(url)
-    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    local headers = {
+        ["Accept"] = "application/json",
+        ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    local req = (syn and syn.request)
+        or (http and http.request)
+        or http_request
+        or request
+        or (fluxus and fluxus.request)
+        or (krnl and krnl.request)
+
     if req then
-        local ok, res = pcall(function() return req({ Url = url, Method = "GET" }) end)
-        if ok and res and res.Body then return res.Body end
+        local ok, res = pcall(function()
+            return req({
+                Url = url,
+                Method = "GET",
+                Headers = headers
+            })
+        end)
+        if ok and type(res) == "table" then
+            local body = res.Body or res.body or res.Response or res.response
+            if body and #tostring(body) > 0 then
+                return tostring(body)
+            end
+        end
     end
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if ok and body then return body end
+
+    local ok2, body2 = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok2 and body2 and #tostring(body2) > 0 then
+        return tostring(body2)
+    end
+
     return nil
 end
 
---================ SERVER HOP (FIXED FOR 773 & RESTRICTED SUB-PLACES) ================--
+--================ SERVER HOP (ROBUST FOR ALL EXECUTORS) ================--
 local VISITED_SERVERS_FILE = "bf_visited_servers.txt"
 local visitedServers = {}
-local isHopping = false
 
 local function loadVisitedServers()
     pcall(function()
@@ -1071,7 +1101,6 @@ local function loadVisitedServers()
                 local id, ts = line:match("([^|]+)|?(%d*)")
                 if id and id ~= "" then
                     local t = tonumber(ts) or 0
-                    -- 20 minutes ke liye cache rakho
                     if os.time() - t < 1200 then
                         visitedServers[id] = true
                     end
@@ -1095,74 +1124,119 @@ local function recordVisitedServer(jobId)
     end)
 end
 
+local function fetchRobloxServers(placeId, sortOrder, cursor)
+    local query = "sortOrder=" .. (sortOrder or "Asc") .. "&limit=100"
+    if cursor and cursor ~= "" and cursor ~= "null" then
+        query = query .. "&cursor=" .. tostring(cursor)
+    end
+
+    -- Primary: official Roblox API
+    local url1 = "https://games.roblox.com/v1/games/" .. tostring(placeId) .. "/servers/Public?" .. query
+    local body = httpGet(url1)
+
+    -- Fallback: RoProxy (reliable mirror for executors when roblox.com is blocked)
+    if not body then
+        local url2 = "https://games.roproxy.com/v1/games/" .. tostring(placeId) .. "/servers/Public?" .. query
+        body = httpGet(url2)
+    end
+
+    if body then
+        local ok, decoded = pcall(function()
+            return HttpService:JSONDecode(body)
+        end)
+        if ok and type(decoded) == "table" and type(decoded.data) == "table" then
+            return decoded
+        end
+    end
+
+    return nil
+end
+
 local function fetchAvailableServers()
     loadVisitedServers()
     local servers = {}
-    local targetPlaceId = getTargetPlaceId()
-    local placeIdStr = tostring(targetPlaceId)
+    local targetPlaceId = game.PlaceId -- Current place ID: prevents Error 773 sub-place mismatch
 
-    -- ANTI-773: Use Descending only! (Ascending servers with 1-2 players are dead/shutting down instances)
-    -- We want active, healthy servers with 5 to 10 players so they are NOT closing down and have open slots.
-    local cursor = nil
-    local guard = 0
-    repeat
-        guard += 1
-        local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=Desc&limit=100"
-        if cursor and cursor ~= "null" and cursor ~= "" then
-            url = url .. "&cursor=" .. tostring(cursor)
-        end
-
-        local body = httpGet(url)
-        if not body then break end
-
-        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if not ok or not data or not data.data then break end
-
+    local function collectServers(data, minPlayers, maxOffset)
+        if not data or not data.data then return end
         for _, s in ipairs(data.data) do
             local sid = tostring(s.id)
             local playing = tonumber(s.playing) or 0
             local max = tonumber(s.maxPlayers) or 12
 
-            -- Strict Anti-773 rules:
-            -- 1. Not current server
-            -- 2. Not already visited in last 20m
-            -- 3. At least 5 players (prevents dying/shutting down servers that trigger 773)
-            -- 4. Room for at least 2 players so server is not full
+            -- Any public server that:
+            -- 1. Is not the current server
+            -- 2. Has not been visited in the last 20 minutes
+            -- 3. Has at least minPlayers
+            -- 4. Is not full (playing <= max - maxOffset)
             if sid ~= game.JobId and not visitedServers[sid] then
-                if playing >= 5 and playing <= (max - 2) then
+                if playing >= (minPlayers or 1) and playing <= (max - (maxOffset or 1)) then
                     table.insert(servers, sid)
                 end
             end
-            if #servers >= 30 then break end
-        end
-
-        cursor = data.nextPageCursor
-    until not cursor or cursor == "null" or #servers >= 30 or guard >= 4
-
-    -- Relaxed fallback if strictly filtered servers were not found (playing 4 to max-1)
-    if #servers == 0 then
-        local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=Desc&limit=100"
-        local body = httpGet(url)
-        if body then
-            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-            if ok and data and data.data then
-                for _, s in ipairs(data.data) do
-                    local sid = tostring(s.id)
-                    local playing = tonumber(s.playing) or 0
-                    local max = tonumber(s.maxPlayers) or 12
-                    if sid ~= game.JobId and not visitedServers[sid] then
-                        if playing >= 4 and playing < max then
-                            table.insert(servers, sid)
-                        end
-                    end
-                    if #servers >= 20 then break end
-                end
-            end
+            if #servers >= 40 then break end
         end
     end
 
+    -- Pass 1: Ascending sort order (servers with open slots, 2+ players)
+    local cursor = nil
+    local guard = 0
+    repeat
+        guard += 1
+        local data = fetchRobloxServers(targetPlaceId, "Asc", cursor)
+        if data then
+            collectServers(data, 2, 1)
+            cursor = data.nextPageCursor
+        else
+            break
+        end
+    until not cursor or cursor == "null" or #servers >= 30 or guard >= 3
+
+    -- Pass 2: Descending sort order if Ascending didn't yield enough
+    if #servers < 10 then
+        cursor = nil
+        guard = 0
+        repeat
+            guard += 1
+            local data = fetchRobloxServers(targetPlaceId, "Desc", cursor)
+            if data then
+                collectServers(data, 2, 1)
+                cursor = data.nextPageCursor
+            else
+                break
+            end
+        until not cursor or cursor == "null" or #servers >= 30 or guard >= 3
+    end
+
+    -- Pass 3: Relaxed criteria (any public server with 1+ player and space)
+    if #servers == 0 then
+        local data = fetchRobloxServers(targetPlaceId, "Asc", nil)
+            or fetchRobloxServers(targetPlaceId, "Desc", nil)
+        if data then
+            collectServers(data, 1, 1)
+        end
+    end
+
+    -- Pass 4: Reset visited list if all available servers have been visited
     if #servers == 0 then
         visitedServers = { [game.JobId] = true }
+        pcall(function()
+            if writefile then
+                writefile(VISITED_SERVERS_FILE, game.JobId .. "|" .. tostring(os.time()))
+            end
+        end)
+        local data = fetchRobloxServers(targetPlaceId, "Asc", nil)
+            or fetchRobloxServers(targetPlaceId, "Desc", nil)
+        if data and data.data then
+            for _, s in ipairs(data.data) do
+                local sid = tostring(s.id)
+                local playing = tonumber(s.playing) or 0
+                local max = tonumber(s.maxPlayers) or 12
+                if sid ~= game.JobId and playing < max then
+                    table.insert(servers, sid)
+                end
+            end
+        end
     end
 
     return servers, targetPlaceId
@@ -1183,10 +1257,10 @@ local function scheduleHopRetry(delaySeconds, reason)
         isHoppingActive = false
         isAttemptPending = false
         hopAttempts = 0
-        updateStatus("Hop failed after 10 tries - staying in server")
-        notify("Server hop failed 10 times - stopped")
+        updateStatus("Hop failed after 10 tries - retrying in 90s")
+        notify("Server hop failed 10 times - retrying next timer")
         if autoHopButton then
-            autoHopButton.Text = "6. Auto Hop: Failed (10x)"
+            autoHopButton.Text = "6. Auto Hop: Retrying"
             autoHopButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
         end
         return
@@ -1207,10 +1281,10 @@ function executeHopAttempt()
     if hopAttempts >= MAX_HOP_TRIES then
         isHoppingActive = false
         hopAttempts = 0
-        updateStatus("Hop failed after 10 tries - staying in server")
-        notify("Server hop failed 10 times - stopped")
+        updateStatus("Hop failed after 10 tries - retrying in 90s")
+        notify("Server hop failed 10 times - retrying next timer")
         if autoHopButton then
-            autoHopButton.Text = "6. Auto Hop: Failed (10x)"
+            autoHopButton.Text = "6. Auto Hop: Retrying"
             autoHopButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
         end
         return
@@ -1219,18 +1293,18 @@ function executeHopAttempt()
     hopAttempts += 1
     updateStatus("Hop attempt " .. hopAttempts .. "/" .. MAX_HOP_TRIES .. "...")
 
-    -- Restricted area se bachne ke liye hop se pehle safe zone mein jao
+    -- Safe zone warp before teleport to prevent combat log or void desync
     local hopZone = nearestSafeZoneCF()
     if hopZone then
         updateStatus("Safe zone before hop...")
         warpTo(hopZone.CFrame + Vector3.new(0, 8, 0))
-        task.wait(0.6)
+        task.wait(0.5)
     end
 
     writeHopMarker(farming, "a")
 
     local servers, targetPlaceId = fetchAvailableServers()
-    targetPlaceId = targetPlaceId or getTargetPlaceId()
+    targetPlaceId = game.PlaceId
 
     -- Queue script for auto execution upon joining new server
     pcall(function()
@@ -1248,31 +1322,32 @@ function executeHopAttempt()
         end
     end)
 
-    if #servers > 0 and hopAttempts < 8 then
+    if #servers > 0 then
         local chosen = servers[math.random(1, #servers)]
         recordVisitedServer(chosen)
         updateStatus("Joining server " .. chosen:sub(1, 8) .. " (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
 
-        -- Method 1: Modern TeleportAsync with TeleportOptions (prevents Error 773 sub-place mismatch)
         local teleportStarted = false
+
+        -- Method 1: TeleportToPlaceInstance (most reliable on all executors)
         local ok, err = pcall(function()
-            local opt = Instance.new("TeleportOptions")
-            opt.ServerInstanceId = chosen
-            TeleportService:TeleportAsync(targetPlaceId, { Player }, opt)
+            TeleportService:TeleportToPlaceInstance(targetPlaceId, chosen, Player)
         end)
 
         if ok then
             teleportStarted = true
         else
-            warn("[ServerHop] TeleportAsync error: " .. tostring(err) .. " - trying TeleportToPlaceInstance")
-            -- Method 2: Fallback to TeleportToPlaceInstance
+            warn("[ServerHop] TeleportToPlaceInstance error: " .. tostring(err) .. " - trying TeleportAsync")
+            -- Method 2: Fallback to TeleportAsync
             local ok2, err2 = pcall(function()
-                TeleportService:TeleportToPlaceInstance(targetPlaceId, chosen, Player)
+                local opt = Instance.new("TeleportOptions")
+                opt.ServerInstanceId = chosen
+                TeleportService:TeleportAsync(targetPlaceId, { Player }, opt)
             end)
             if ok2 then
                 teleportStarted = true
             else
-                warn("[ServerHop] TeleportToPlaceInstance error: " .. tostring(err2))
+                warn("[ServerHop] TeleportAsync error: " .. tostring(err2))
             end
         end
 
@@ -1281,26 +1356,15 @@ function executeHopAttempt()
             return
         end
 
-        -- Watchdog timeout: agar 6.5s mein teleport nahi hua toh retry karo
+        -- Watchdog timeout: agar 8s mein teleport nahi hua toh retry karo
         local oldJob = game.JobId
-        task.delay(6.5, function()
+        task.delay(8, function()
             if game.JobId == oldJob and getHRP() and isHoppingActive then
                 scheduleHopRetry(Config.HopRetryDelay, "Hop timed out")
             end
         end)
     else
-        -- Method 3 Fallback: Standard Teleport matchmaking (CANNOT trigger Error 773)
-        -- Used when server list is exhausted or after 7 direct attempts failed
-        updateStatus("Matchmaker hop (" .. hopAttempts .. "/" .. MAX_HOP_TRIES .. ")...")
-        pcall(function()
-            TeleportService:Teleport(targetPlaceId, Player)
-        end)
-        local oldJob = game.JobId
-        task.delay(7, function()
-            if game.JobId == oldJob and getHRP() and isHoppingActive then
-                scheduleHopRetry(Config.HopRetryDelay, "Matchmaker hop timed out")
-            end
-        end)
+        scheduleHopRetry(Config.HopRetryDelay, "No open servers found")
     end
 end
 
@@ -1350,17 +1414,15 @@ local function handlePromptOverlay(overlay)
                 prompt.Visible = false
                 prompt:Destroy()
             end)
-            updateStatus("Error 773 dismissed - retrying server...")
-            scheduleHopRetry(Config.HopRetryDelay, "Error 773 cleared")
+            updateStatus("Error prompt dismissed - retrying server...")
+            scheduleHopRetry(Config.HopRetryDelay, "Error cleared")
         end
     end
 
-    -- Hook newly added prompts
     overlay.ChildAdded:Connect(function(child)
         dismissPrompt(child)
     end)
 
-    -- Check if ErrorPrompt is already on screen right now
     for _, child in ipairs(overlay:GetChildren()) do
         if child.Name == "ErrorPrompt" then
             dismissPrompt(child)
@@ -1394,14 +1456,14 @@ pcall(function()
     end
 end)
 
---================ AUTO SERVER HOP (1x hop after 70 seconds) ================--
+--================ AUTO SERVER HOP (1x hop after 90 seconds) ================--
 local autoHopEnabled = true
 local autoHopButton = nil
 
 local function updateAutoHopButton()
     if autoHopButton then
         if not autoHopEnabled then
-            autoHopButton.Text = "6. Auto Hop (70s): OFF"
+            autoHopButton.Text = "6. Auto Hop (90s): OFF"
             autoHopButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
         end
     end
@@ -1427,7 +1489,7 @@ local function autoHopLoop()
             autoHopButton.Text = "6. Auto Hop: Hopping..."
             autoHopButton.BackgroundColor3 = Color3.fromRGB(200, 140, 40)
         end
-        notify("70s reached - hopping to new server...")
+        notify("90s reached - hopping to new server...")
         serverHop()
     end
 end
@@ -1467,7 +1529,7 @@ local function checkServerHopMarker()
         end
 
         notify("Joined new server")
-        updateStatus("Server joined - 70s timer started")
+        updateStatus("Server joined - 90s timer started")
 
         if farmFlag == "1" then
             task.delay(4, function()
@@ -1709,10 +1771,10 @@ local function buildGUI()
         end
     end)
 
-    autoHopButton = makeButton("6. Auto Hop: 70s", 310, Color3.fromRGB(60, 200, 90), function()
+    autoHopButton = makeButton("6. Auto Hop: 90s", 310, Color3.fromRGB(60, 200, 90), function()
         autoHopEnabled = not autoHopEnabled
         updateAutoHopButton()
-        updateStatus(autoHopEnabled and "Auto hop ON (after 70s)" or "Auto hop OFF")
+        updateStatus(autoHopEnabled and "Auto hop ON (after 90s)" or "Auto hop OFF")
     end)
     updateAutoHopButton()
 
