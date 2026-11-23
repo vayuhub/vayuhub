@@ -6,7 +6,6 @@ local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
 
@@ -29,12 +28,7 @@ local Config = {
     ChestArriveDistance = 120, -- itne se zyada door ho toh chest claim skip (retry allowed)
     MaxChestAttempts = 2,      -- ek chest ko max itni baar try karega
     FarmButtonName = "Auto Chest Farm",
-    MinServerHours = 4,        -- server hop sirf itne ghante purane (4h+) servers pe karega
-    MaxHopAttempts = 12,       -- itne failed hops ke baad current server pe hi farm (no infinite hop)
-    AutoHopInterval = 60,      -- auto server hop har itne seconds
-    HopRetryDelay = 4,         -- teleport fail ho toh itne seconds mein retry
-    MaxAutoHops = 34,          -- auto hop ka total limit
-    AutoHopSessionReset = 2700,-- itne seconds baad hop counter reset (naya session)
+    AutoHopInterval = 65,      -- auto server hop har itne seconds (fixed server-hop code)
 }
 
 --================ TARGET ITEMS ================--
@@ -805,9 +799,7 @@ local function teleportSafeZone()
     end
 end
 
---================ 4H+ SERVER HOP ================--
-local HOP_MARKER_FILE = "bf_4h_server_hop.txt"
-local HOP_MARKER_MAX_AGE = 900 -- marker 15 min se purana ho toh ignore (stale hop na chale)
+--================ SERVER HOP HELPERS ================--
 
 local function getServerUptimeSeconds()
     local ok, t = pcall(function() return Workspace.DistributedGameTime end)
@@ -948,28 +940,6 @@ local function getEstimatedServerAge()
     return best
 end
 
-local pendingHopCount = 0
-
--- Marker format: timestamp|farmFlag|hopCount|mode ("a" = any-server auto hop, no age check)
-local function writeHopMarker(farmFlag, mode)
-    pcall(function()
-        if writefile then
-            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0") .. "|" .. tostring(pendingHopCount) .. "|" .. (mode or ""))
-        end
-    end)
-    pendingHopCount = 0
-end
-
-local function clearHopMarker()
-    pcall(function()
-        if delfile and isfile and isfile(HOP_MARKER_FILE) then
-            delfile(HOP_MARKER_FILE)
-        elseif writefile then
-            writefile(HOP_MARKER_FILE, "")
-        end
-    end)
-end
-
 local function startChestFarm()
     farming = true
     visitedChests = {}
@@ -985,187 +955,198 @@ local function startChestFarm()
     task.spawn(chestFarmLoop)
 end
 
---================ SERVER HOP ================--
-local function httpGet(url)
-    if syn and syn.request then
-        local res = syn.request({ Url = url, Method = "GET" })
-        return res and res.Body
-    end
-    if http and http.request then
-        local res = http.request({ Url = url, Method = "GET" })
-        return res and res.Body
-    end
-    if http_request then
-        local res = http_request({ Url = url, Method = "GET" })
-        return res and res.Body
-    end
-    return game:HttpGet(url)
+--================ SERVER HOP (FIXED V4) ================--
+local HOP_INTERVAL       = Config.AutoHopInterval or 65
+local RETRY_DELAY        = 5
+local FLOOD_RETRY_DELAY  = 10
+local MAX_RETRIES        = 10
+local SAFE_ZONE_OFFSET   = 8
+local SAFE_ZONE_RETRIES  = 5
+local LANDING_SETTLE     = 3
+local CHAR_LOAD_TIMEOUT  = 30
+
+local HOP_MARKER_FILE    = "bf_hop_marker.txt"
+local HOP_MARKER_MAX_AGE = 900
+
+local isHopping  = false
+local retryCount = 0
+
+local function writeHopMarker(farmFlag)
+    pcall(function()
+        if writefile then
+            writefile(HOP_MARKER_FILE, tostring(os.time()) .. "|" .. (farmFlag and "1" or "0"))
+        end
+    end)
 end
 
-function serverHop(anyServer)
-    local wasFarming = farming
-    farming = false
-    if activeTween then
-        pcall(function() activeTween:Cancel() end)
-        activeTween = nil
-    end
-    setNoclip(false)
-    setProbeAnchor(false)
-    if farmButton then
-        farmButton.Text = "Auto Chest Farm: OFF"
-        farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
-    end
-    if anyServer then
-        updateStatus("Auto hop: random server...")
-    else
-        updateStatus("Hopping for " .. Config.MinServerHours .. "h+ server...")
+local function clearHopMarker()
+    pcall(function()
+        if delfile and isfile and isfile(HOP_MARKER_FILE) then
+            delfile(HOP_MARKER_FILE)
+        elseif writefile then
+            writefile(HOP_MARKER_FILE, "")
+        end
+    end)
+end
+
+local function forceIntoSafeZone(reason)
+    for attempt = 1, SAFE_ZONE_RETRIES do
+        local hrp = getHRP()
+        if not hrp then
+            task.wait(0.5)
+            continue
+        end
+
+        local zone = nearestSafeZoneCF()
+        if not zone then
+            if attempt < SAFE_ZONE_RETRIES then
+                task.wait(1)
+                continue
+            end
+            warn("[Hop] Safe zone not found - " .. (reason or ""))
+            return false
+        end
+
+        pcall(function() setNoclip(true) end)
+        pcall(function() setProbeAnchor(true) end)
+
+        local targetCF = zone.CFrame + Vector3.new(0, SAFE_ZONE_OFFSET, 0)
+        warpTo(targetCF)
+        task.wait(0.3)
+        warpTo(targetCF)
+        task.wait(0.2)
+
+        pcall(function() setProbeAnchor(false) end)
+        pcall(function() setNoclip(false) end)
+
+        updateStatus("Safe zone ✓ - " .. (reason or ""))
+        return true
     end
 
-    -- Restricted area se bachne ke liye hop se pehle safe zone mein jao
-    local hopZone = nearestSafeZoneCF()
-    if hopZone then
-        updateStatus("Safe zone before hop...")
-        warpTo(hopZone.CFrame + Vector3.new(0, 8, 0))
-        task.wait(0.8)
-    end
+    pcall(function() setProbeAnchor(false) end)
+    pcall(function() setNoclip(false) end)
+    return false
+end
 
-    -- Auto-hop mode: kisi bhi random server pe jao (server list ki zaroorat nahi)
-    if anyServer then
-        writeHopMarker(wasFarming, "a")
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, Player)
+local function fireTeleport()
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, Player)
+    end)
+end
+
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult)
+    if player ~= Player then return end
+
+    local reason = tostring(teleportResult)
+    warn("[Hop] Teleport failed:", reason)
+
+    retryCount += 1
+
+    if retryCount > MAX_RETRIES then
+        isHopping = false
+        retryCount = 0
+        clearHopMarker()
+        notify("Hop failed after " .. MAX_RETRIES .. " retries - next cycle mein try hoga")
+        task.delay(1, function()
+            if getHRP() then
+                forceIntoSafeZone("after max retries")
+            end
         end)
         return
     end
 
-    local servers = {}
-    pcall(function()
-        local cursor = nil
-        local guard = 0
-        repeat
-            guard += 1
-            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
-            if cursor and cursor ~= "null" then
-                url = url .. "&cursor=" .. cursor
-            end
-            local body = httpGet(url)
-            if not body then break end
-            local data = HttpService:JSONDecode(body)
-            for _, s in ipairs(data.data or {}) do
-                if s.id ~= game.JobId and s.playing < s.maxPlayers then
-                    table.insert(servers, tostring(s.id))
-                end
-                if #servers >= 25 then break end
-            end
-            cursor = data.nextPageCursor
-        until not cursor or cursor == "null" or #servers >= 25 or guard >= 3
-    end)
+    local delay = RETRY_DELAY
+    if teleportResult == Enum.TeleportResult.Flooded then
+        delay = FLOOD_RETRY_DELAY
+        updateStatus(string.format("Rate limited - retry %d/%d in %ds...", retryCount, MAX_RETRIES, delay))
+    else
+        updateStatus(string.format("Hop failed - retry %d/%d in %ds...", retryCount, MAX_RETRIES, delay))
+    end
 
-    -- Naye server pe pahunche toh uptime check hoga; farm chal raha tha toh wapas start hoga
+    task.delay(delay, function()
+        if not isHopping then return end
+        if getHRP() then
+            forceIntoSafeZone("before retry")
+            task.wait(0.5)
+        end
+        updateStatus(string.format("Retrying hop... (%d/%d)", retryCount, MAX_RETRIES))
+        fireTeleport()
+    end)
+end)
+
+function serverHop()
+    if isHopping then
+        warn("[Hop] Already hopping, ignoring")
+        return
+    end
+    isHopping = true
+    retryCount = 0
+
+    local wasFarming = farming
+    farming = false
+
+    if activeTween then
+        pcall(function() activeTween:Cancel() end)
+        activeTween = nil
+    end
+
+    if farmButton then
+        farmButton.Text = "Auto Chest Farm: OFF"
+        farmButton.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+    end
+
+    updateStatus("Preparing hop...")
+
+    forceIntoSafeZone("before hop")
+    task.wait(0.5)
+
     writeHopMarker(wasFarming)
 
-    if #servers > 0 then
-        local chosen = servers[math.random(1, #servers)]
-        local oldJob = game.JobId
-        pcall(function()
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen, Player)
-        end)
-        -- TeleportToPlaceInstance async fail ho sakta hai (error 773 - restricted).
-        -- pcall ise catch nahi karta, isliye thode der baad check karo:
-        -- agar wahi server pe ho toh random server pe chalo.
-        task.delay(6, function()
-            if game.JobId == oldJob and getHRP() then
-                updateStatus("JobId teleport failed - random server hop...")
-                pcall(function()
-                    TeleportService:Teleport(game.PlaceId, Player)
-                end)
-            end
-        end)
-    else
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, Player)
-        end)
-    end
+    updateStatus("Hopping...")
+    fireTeleport()
 end
 
---================ AUTO SERVER HOP (har 60s, koi bhi server) ================--
-local AUTO_HOP_FILE = "bf_auto_hop.txt"
+--================ AUTO SERVER HOP ================--
 local autoHopEnabled = true
 local autoHopButton = nil
 
 local function updateAutoHopButton()
     if autoHopButton then
-        autoHopButton.Text = autoHopEnabled and "6. Auto Hop (60s): ON" or "6. Auto Hop (60s): OFF"
+        autoHopButton.Text = autoHopEnabled and string.format("6. Auto Hop (%ds): ON", HOP_INTERVAL) or string.format("6. Auto Hop (%ds): OFF", HOP_INTERVAL)
         autoHopButton.BackgroundColor3 = autoHopEnabled and Color3.fromRGB(60, 200, 90) or Color3.fromRGB(220, 60, 60)
     end
 end
 
-local function loadAutoHopState()
-    local count, last = 0, 0
-    pcall(function()
-        if readfile and isfile and isfile(AUTO_HOP_FILE) then
-            local c, l = tostring(readfile(AUTO_HOP_FILE)):match("(%d+)|?(%d*)")
-            count = tonumber(c) or 0
-            last = tonumber(l) or 0
-        end
-    end)
-    -- Purana session ho toh counter reset
-    if os.time() - last > Config.AutoHopSessionReset then
-        count = 0
-    end
-    return count, last
-end
-
-local function saveAutoHopState(count, last)
-    pcall(function()
-        if writefile then
-            writefile(AUTO_HOP_FILE, tostring(count) .. "|" .. tostring(last))
-        end
-    end)
-end
-
 local function autoHopLoop()
-    local count, lastHop = loadAutoHopState()
-    if lastHop == 0 then
-        lastHop = os.time() -- fresh session: pehla hop 60s baad
-    end
+    local nextHopTime = os.time() + HOP_INTERVAL
+
     while true do
-        task.wait(1)
-        if autoHopEnabled then
-            local remain = Config.AutoHopInterval - (os.time() - lastHop)
-            if remain <= 0 then
-                if count >= Config.MaxAutoHops then
-                    notify("Auto hop limit (" .. Config.MaxAutoHops .. ") reached - auto hop OFF")
-                    updateStatus("Auto hop limit reached")
-                    autoHopEnabled = false
-                    updateAutoHopButton()
+        if not autoHopEnabled then
+            nextHopTime = os.time() + HOP_INTERVAL
+            task.wait(1)
+        else
+            local remain = nextHopTime - os.time()
+            if remain > 0 then
+                if remain <= 10 then
+                    updateStatus(string.format("Next hop in %ds...", remain))
+                end
+                task.wait(math.min(remain, 3))
+            else
+                nextHopTime = os.time() + HOP_INTERVAL
+
+                if isHopping then
+                    updateStatus("Previous hop still retrying - waiting...")
+                    task.wait(5)
                 else
-                    count += 1
-                    lastHop = os.time()
-                    saveAutoHopState(count, lastHop)
-                    updateStatus("Auto hop " .. count .. "/" .. Config.MaxAutoHops .. " - random server")
-                    serverHop(true)
-                    -- Teleport fail ho (same JobId) toh har 4s mein retry
-                    local oldJob = game.JobId
-                    for _ = 1, 4 do
-                        task.wait(Config.HopRetryDelay)
-                        if game.JobId ~= oldJob then break end
-                        if count < Config.MaxAutoHops then
-                            count += 1
-                            lastHop = os.time()
-                            saveAutoHopState(count, lastHop)
-                        end
-                        serverHop(true)
-                        oldJob = game.JobId
-                    end
+                    updateStatus("Auto hop triggered!")
+                    serverHop()
+                    task.wait(HOP_INTERVAL)
                 end
             end
         end
     end
 end
 
--- Naye server pe script re-run hone ke baad: agar hum 4h+ hop ke beech mein the
--- toh uptime check karo; kam hai toh dobara hop, 4h+ hai toh (chahiye toh) farm resume.
 local function checkServerHopMarker()
     local data
     pcall(function()
@@ -1181,70 +1162,72 @@ local function checkServerHopMarker()
     end
     local ts = tonumber(parts[1])
     local farmFlag = parts[2]
-    local hopCount = tonumber(parts[3]) or 0
-    local mode = parts[4]
+
     if not ts or (os.time() - ts) > HOP_MARKER_MAX_AGE then
         clearHopMarker()
         return
     end
 
+    clearHopMarker()
+
     task.spawn(function()
-        -- Pehle character fully load hone do; warna hop ke turant baad warp karne se
-        -- game "restricted area" bhej deta hai
-        if not waitForCharacter(25) then
-            updateStatus("Character not loaded yet - waiting...")
-        end
-        task.wait(1.5)
-
-        -- Spawn point restricted/unsafe area mein ho sakta hai - safe zone mein land karo
-        local zone = nearestSafeZoneCF()
-        if zone and getHRP() then
-            warpTo(zone.CFrame + Vector3.new(0, 8, 0))
-            task.wait(0.8)
+        updateStatus("Loading character...")
+        if not waitForCharacter(CHAR_LOAD_TIMEOUT) then
+            updateStatus("Slow load - waiting more...")
+            task.wait(5)
+            if not waitForCharacter(15) then
+                notify("Character load failed")
+                return
+            end
         end
 
-        -- Auto-hop ("a" mode): kisi bhi server pe land kiya - age check skip, bas settle karke farm resume
-        if mode == "a" then
-            clearHopMarker()
-            notify("Joined server (auto hop)")
-            updateStatus("Server joined")
-            if farmFlag == "1" then
-                task.delay(5, function()
-                    if waitForCharacter(10) then
-                        startChestFarm()
-                    end
-                end)
+        pcall(function() setProbeAnchor(true) end)
+        pcall(function() setNoclip(true) end)
+        task.wait(0.3)
+
+        updateStatus("Warping to safe zone...")
+        for attempt = 1, SAFE_ZONE_RETRIES do
+            local zone = nearestSafeZoneCF()
+            local hrp = getHRP()
+            if zone and hrp then
+                local targetCF = zone.CFrame + Vector3.new(0, SAFE_ZONE_OFFSET, 0)
+                warpTo(targetCF)
+                task.wait(0.3)
+                warpTo(targetCF)
+                break
             end
-            return
+            task.wait(1)
         end
 
-        local age = getEstimatedServerAge()
-        local minUptime = Config.MinServerHours * 3600
-        if age >= minUptime or hopCount >= Config.MaxHopAttempts then
-            clearHopMarker()
-            if hopCount >= Config.MaxHopAttempts and age < minUptime then
-                notify("Hop limit - is server pe farm kar rahe hain")
-                updateStatus("Hop limit reached - farming here")
-            else
-                notify("Joined " .. math.floor(age / 3600) .. "h+ server")
-                updateStatus("4h+ server joined")
+        updateStatus("Settling...")
+        task.wait(LANDING_SETTLE)
+
+        pcall(function() setProbeAnchor(false) end)
+        task.wait(0.2)
+        pcall(function() setNoclip(false) end)
+
+        task.wait(0.5)
+        local hrpCheck = getHRP()
+        if hrpCheck then
+            local finalZone = nearestSafeZoneCF()
+            if finalZone then
+                local dist = (hrpCheck.Position - finalZone.CFrame.Position).Magnitude
+                if dist > 100 then
+                    updateStatus("Position reset - fixing...")
+                    forceIntoSafeZone("post-settle fix")
+                    task.wait(1)
+                end
             end
-            if farmFlag == "1" then
-                -- Anti-cheat settle hone ka time do, phir hi farm resume karo
-                task.delay(5, function()
-                    if waitForCharacter(10) then
-                        startChestFarm()
-                    else
-                        updateStatus("Character load nahi hua - farm manually start karo")
-                    end
-                end)
-            end
-        else
-            updateStatus("Server " .. math.floor(age / 60) .. "m old - hopping again...")
-            pendingHopCount = hopCount + 1
+        end
+
+        notify("Server joined!")
+        updateStatus("Ready")
+        isHopping = false
+
+        if farmFlag == "1" then
             task.delay(3, function()
-                if waitForCharacter(15) then
-                    serverHop()
+                if waitForCharacter(10) then
+                    startChestFarm()
                 end
             end)
         end
@@ -1463,7 +1446,7 @@ local function buildGUI()
     makeButton("2. Castle on the Sea", 108, Color3.fromRGB(160, 90, 90), teleportCastleOnSea)
     makeButton("3. Safe Zone", 148, Color3.fromRGB(70, 140, 90), teleportSafeZone)
     makeButton("4. Fist of Darkness Lab", 188, Color3.fromRGB(140, 80, 160), insertFistOfDarkness)
-    makeButton("5. Server Hop (4h+)", 228, Color3.fromRGB(200, 140, 40), serverHop)
+    makeButton("5. Server Hop", 228, Color3.fromRGB(200, 140, 40), serverHop)
 
     farmButton = makeButton("Auto Chest Farm: OFF", 268, Color3.fromRGB(220, 60, 60), function()
         if farming then
@@ -1481,10 +1464,10 @@ local function buildGUI()
         end
     end)
 
-    autoHopButton = makeButton("6. Auto Hop (60s): ON", 310, Color3.fromRGB(60, 200, 90), function()
+    autoHopButton = makeButton("6. Auto Hop: ON", 310, Color3.fromRGB(60, 200, 90), function()
         autoHopEnabled = not autoHopEnabled
         updateAutoHopButton()
-        updateStatus(autoHopEnabled and "Auto hop ON - har 60s random server" or "Auto hop OFF")
+        updateStatus(autoHopEnabled and string.format("Auto hop ON - har %ds random server", HOP_INTERVAL) or "Auto hop OFF")
     end)
     updateAutoHopButton()
 
