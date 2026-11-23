@@ -1028,19 +1028,14 @@ end
 
 --================ SERVER HOP ================--
 local function httpGet(url)
-    if syn and syn.request then
-        local res = syn.request({ Url = url, Method = "GET" })
-        return res and res.Body
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+    if req then
+        local ok, res = pcall(function() return req({ Url = url, Method = "GET" }) end)
+        if ok and res and res.Body then return res.Body end
     end
-    if http and http.request then
-        local res = http.request({ Url = url, Method = "GET" })
-        return res and res.Body
-    end
-    if http_request then
-        local res = http_request({ Url = url, Method = "GET" })
-        return res and res.Body
-    end
-    return game:HttpGet(url)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and body then return body end
+    return nil
 end
 
 --================ SERVER HOP (FIXED FOR 773 & RESTRICTED SUB-PLACES) ================--
@@ -1082,56 +1077,23 @@ end
 local function fetchAvailableServers()
     loadVisitedServers()
     local servers = {}
-    local cursor = nil
-    local guard = 0
+    local placeIdStr = tostring(game.PlaceId) -- tostring used to avoid 32-bit integer overflow on large Place IDs
 
-    repeat
-        guard += 1
-        -- sortOrder=Desc returns populated/active servers (avoiding 0-1 player dead/closing servers that trigger Error 773)
-        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", game.PlaceId)
-        if cursor and cursor ~= "null" then
-            url = url .. "&cursor=" .. cursor
-        end
-
-        local body = httpGet(url)
-        if not body then break end
-
-        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if not ok or not data or not data.data then break end
-
-        for _, s in ipairs(data.data) do
-            local sid = tostring(s.id)
-            local playing = tonumber(s.playing) or 0
-            local max = tonumber(s.maxPlayers) or 12
-
-            -- Anti-773 Server Filtering:
-            -- 1. Never current server
-            -- 2. At least 2 players (prevents dead / shutting down / closed instances)
-            -- 3. Room for at least 2 players (playing <= max - 2) so we never hit full server rejection
-            -- 4. Not in recent visited blacklist
-            if sid ~= game.JobId and not visitedServers[sid] then
-                if playing >= 2 and playing <= (max - 2) then
-                    table.insert(servers, sid)
-                end
-            end
-            if #servers >= 25 then break end
-        end
-
-        cursor = data.nextPageCursor
-    until not cursor or cursor == "null" or #servers >= 25 or guard >= 4
-
-    -- Relaxed fallback: if strict filter didn't find enough, allow (playing < max)
-    if #servers == 0 then
-        cursor = nil
-        guard = 0
+    -- Try Ascending first (avoids full servers, checks for healthy servers with open slots)
+    local sortModes = { "Asc", "Desc" }
+    for _, sortMode in ipairs(sortModes) do
+        local cursor = nil
+        local guard = 0
         repeat
             guard += 1
-            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", game.PlaceId)
-            if cursor and cursor ~= "null" then
-                url = url .. "&cursor=" .. cursor
+            local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=" .. sortMode .. "&limit=100"
+            if cursor and cursor ~= "null" and cursor ~= "" then
+                url = url .. "&cursor=" .. tostring(cursor)
             end
+
             local body = httpGet(url)
             if not body then break end
+
             local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
             if not ok or not data or not data.data then break end
 
@@ -1139,18 +1101,48 @@ local function fetchAvailableServers()
                 local sid = tostring(s.id)
                 local playing = tonumber(s.playing) or 0
                 local max = tonumber(s.maxPlayers) or 12
+
+                -- ANTI-773 RULES:
+                -- 1. Never current server
+                -- 2. At least 3 players (1-2 player servers are often shutting down or restricted instances)
+                -- 3. Room for at least 2 players (playing <= max - 2) so server is not full
+                -- 4. Not in recently failed/visited blacklist
                 if sid ~= game.JobId and not visitedServers[sid] then
-                    if playing >= 2 and playing < max then
+                    if playing >= 3 and playing <= (max - 2) then
                         table.insert(servers, sid)
                     end
                 end
-                if #servers >= 15 then break end
+                if #servers >= 30 then break end
             end
+
             cursor = data.nextPageCursor
-        until not cursor or cursor == "null" or #servers >= 15 or guard >= 3
+        until not cursor or cursor == "null" or #servers >= 30 or guard >= 3
+
+        if #servers >= 5 then break end
     end
 
-    -- If all servers are blacklisted, reset visited list except current server
+    -- Fallback: Relaxed filter if no server matched strict conditions
+    if #servers == 0 then
+        local url = "https://games.roblox.com/v1/games/" .. placeIdStr .. "/servers/Public?sortOrder=Desc&limit=100"
+        local body = httpGet(url)
+        if body then
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if ok and data and data.data then
+                for _, s in ipairs(data.data) do
+                    local sid = tostring(s.id)
+                    local playing = tonumber(s.playing) or 0
+                    local max = tonumber(s.maxPlayers) or 12
+                    if sid ~= game.JobId and not visitedServers[sid] then
+                        if playing >= 2 and playing < max then
+                            table.insert(servers, sid)
+                        end
+                    end
+                    if #servers >= 20 then break end
+                end
+            end
+        end
+    end
+
     if #servers == 0 then
         visitedServers = { [game.JobId] = true }
     end
@@ -1240,6 +1232,44 @@ pcall(function()
             end)
         end
     end)
+end)
+
+-- Anti-773 CoreGui ErrorPrompt Auto-Dismiss & Recovery
+pcall(function()
+    local rpg = CoreGui:FindFirstChild("RobloxPromptGui")
+    local promptOverlay = rpg and rpg:FindFirstChild("promptOverlay")
+    if not promptOverlay then
+        task.spawn(function()
+            local gui = CoreGui:WaitForChild("RobloxPromptGui", 10)
+            if gui then
+                local overlay = gui:WaitForChild("promptOverlay", 10)
+                if overlay then
+                    overlay.ChildAdded:Connect(function(child)
+                        if child.Name == "ErrorPrompt" then
+                            task.wait(0.3)
+                            isHopping = false
+                            updateStatus("Error 773 detected - auto switching server...")
+                            local btn = child:FindFirstChild("Button", true) or child:FindFirstChild("ConfirmButton", true)
+                            if btn then
+                                pcall(function()
+                                    local vim = game:GetService("VirtualInputManager")
+                                    if vim then
+                                        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
+                                        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+                                        task.wait(0.05)
+                                        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+                                    end
+                                end)
+                            end
+                            task.delay(1, function()
+                                serverHop(true)
+                            end)
+                        end
+                    end)
+                end
+            end
+        end)
+    end
 end)
 
 --================ AUTO SERVER HOP (har 60s, koi bhi server) ================--
